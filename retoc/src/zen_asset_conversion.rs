@@ -1281,6 +1281,7 @@ impl ConvertedZenAssetBundle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_zen_asset_internal<'a>(
     legacy_asset: &FSerializedAssetBundle,
     container_header_version: EIoContainerHeaderVersion,
@@ -1315,6 +1316,7 @@ fn build_zen_asset_internal<'a>(
 }
 
 // Builds zen asset and writes it into the container using the provided serialized legacy asset and package version
+#[allow(clippy::too_many_arguments)]
 pub fn build_zen_asset(
     legacy_asset: FSerializedAssetBundle,
     package_name_to_referenced_shader_maps: &HashMap<String, Vec<FSHAHash>>,

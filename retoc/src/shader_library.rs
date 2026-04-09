@@ -555,8 +555,8 @@ fn layout_write_shader_code(shader_library: &IoStoreShaderCodeArchive, compress_
                         let mut data = shader_uncompressed_data.into();
 
                         // Compress shader if we are allowed to and compression method is known
-                        if compress_shaders && shader_library.compression_method.is_some() {
-                            let shader_compressed_data = compress_shader(shader_uncompressed_data, shader_library.compression_method.unwrap())?;
+                        if let Some(compression_method) = shader_library.compression_method.filter(|_| compress_shaders) {
+                            let shader_compressed_data = compress_shader(shader_uncompressed_data, compression_method)?;
                             let shader_compressed_size = shader_compressed_data.len();
 
                             // Sometimes compression can result in larger size for some small shaders, so only write compressed data if it's actually smaller than uncompressed size

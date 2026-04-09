@@ -483,11 +483,13 @@ fn create_asset_builder<'a, 'b>(package_context: &'a FZenPackageContext<'b>, pac
 }
 fn begin_build_summary(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
     // Populate package summary with basic data
-    let mut legacy_package_summary = FLegacyPackageFileSummary::default();
-    legacy_package_summary.package_name = builder.zen_package.name_map.get(builder.zen_package.summary.name).to_string();
-    legacy_package_summary.package_flags = builder.zen_package.summary.package_flags;
-    legacy_package_summary.package_guid = FGuid { a: 0, b: 0, c: 0, d: 0 };
-    legacy_package_summary.package_source = 0;
+    let mut legacy_package_summary = FLegacyPackageFileSummary {
+        package_name: builder.zen_package.name_map.get(builder.zen_package.summary.name).to_string(),
+        package_flags: builder.zen_package.summary.package_flags,
+        package_guid: FGuid { a: 0, b: 0, c: 0, d: 0 },
+        package_source: 0,
+        ..Default::default()
+    };
 
     let zen_versions: FZenPackageVersioningInfo = builder.zen_package.versioning_info.clone();
 
@@ -587,7 +589,7 @@ fn find_or_add_resolved_import(builder: &mut LegacyAssetBuilder, import: &Resolv
     }
 
     // Outer can either be Null for UPackage imports or an existing import. Imports must never have exports as outers in cooked assets (can actually happen in uncooked OFPA actor assets though)
-    let outer_index: FPackageIndex = if import.outer.is_some() { find_or_add_resolved_import(builder, import.outer.as_ref().unwrap()) } else { FPackageIndex::create_null() };
+    let outer_index: FPackageIndex = if let Some(outer) = &import.outer { find_or_add_resolved_import(builder, outer) } else { FPackageIndex::create_null() };
 
     // Resolve minimal names for each element of the import
     let class_package = builder.legacy_package.name_map.store(&import.class_package);

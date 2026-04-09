@@ -66,7 +66,7 @@ pub struct ParallelPakWriter {
 }
 impl FileWriterTrait for ParallelPakWriter {
     fn write_file(&self, path: String, allow_compress: bool, data: Vec<u8>) -> Result<()> {
-        let entry = self.entry_builder.build_entry(allow_compress, data)?;
+        let entry = self.entry_builder.build_entry(allow_compress, data, &path)?;
         self.tx.send((path, entry))?;
         Ok(())
     }
