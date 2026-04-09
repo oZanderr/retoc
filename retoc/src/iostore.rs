@@ -188,12 +188,22 @@ impl IoStoreBackend {
     }
     pub fn open<P: AsRef<Path>>(dir: P, config: Arc<Config>) -> Result<Self> {
         let mut containers: Vec<Box<dyn IoStoreTrait>> = vec![];
-        for entry in fs::read_dir(dir.as_ref())? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension() == Some(OsStr::new("utoc")) {
-                containers.push(Box::new(IoStoreContainer::open(path, config.clone())?));
+        fn collect_utocs(dir: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_utocs(&path, paths)?;
+                } else if path.extension() == Some(OsStr::new("utoc")) {
+                    paths.push(path);
+                }
             }
+            Ok(())
+        }
+        let mut utoc_paths = Vec::new();
+        collect_utocs(dir.as_ref(), &mut utoc_paths)?;
+        for path in utoc_paths {
+            containers.push(Box::new(IoStoreContainer::open(path, config.clone())?));
         }
         // Validate that all containers are of the same version
         let mut previous_container_version: Option<EIoStoreTocVersion> = None;
