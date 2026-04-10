@@ -3,11 +3,12 @@ use std::{
     ffi::OsStr,
     io::{BufReader, Cursor},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result, bail};
 use fs_err as fs;
+use rayon::prelude::*;
 
 use crate::{
     Config, EIoChunkType, EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FPackageId, Toc,
@@ -57,6 +58,20 @@ where
 
 pub fn open<P: AsRef<Path>>(path: P, config: Arc<Config>) -> Result<Box<dyn IoStoreTrait>> {
     Ok(if path.as_ref().is_dir() { Box::new(IoStoreBackend::open(path, config)?) } else { Box::new(IoStoreContainer::open(path, config)?) })
+}
+
+/// Open a directory of IoStore containers, only including .utoc files whose
+/// stem (file name without extension) passes the given filter.
+pub fn open_filtered<P: AsRef<Path>>(
+    path: P,
+    config: Arc<Config>,
+    filter: impl Fn(&str) -> bool,
+) -> Result<Box<dyn IoStoreTrait>> {
+    Ok(if path.as_ref().is_dir() {
+        Box::new(IoStoreBackend::open_filtered(path, config, filter)?)
+    } else {
+        Box::new(IoStoreContainer::open(path, config)?)
+    })
 }
 
 /// Return an object that can be sorted by to achieve container priority.
@@ -187,7 +202,9 @@ impl IoStoreBackend {
         Ok(Self { containers: vec![] })
     }
     pub fn open<P: AsRef<Path>>(dir: P, config: Arc<Config>) -> Result<Self> {
-        let mut containers: Vec<Box<dyn IoStoreTrait>> = vec![];
+        Self::open_filtered(dir, config, |_| true)
+    }
+    pub fn open_filtered<P: AsRef<Path>>(dir: P, config: Arc<Config>, filter: impl Fn(&str) -> bool) -> Result<Self> {
         fn collect_utocs(dir: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
@@ -202,20 +219,25 @@ impl IoStoreBackend {
         }
         let mut utoc_paths = Vec::new();
         collect_utocs(dir.as_ref(), &mut utoc_paths)?;
-        for path in utoc_paths {
-            containers.push(Box::new(IoStoreContainer::open(path, config.clone())?));
-        }
-        // Validate that all containers are of the same version
+        utoc_paths.retain(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(&filter)
+        });
+        let mut containers: Vec<Box<dyn IoStoreTrait>> = utoc_paths
+            .into_par_iter()
+            .map(|path| -> Result<Box<dyn IoStoreTrait>> {
+                Ok(Box::new(IoStoreContainer::open(path, config.clone())?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Validate that all containers are of the same TOC version
         let mut previous_container_version: Option<EIoStoreTocVersion> = None;
         let mut previous_container_name: String = String::new();
-        let mut previous_header_container_version: Option<EIoContainerHeaderVersion> = None;
-        let mut previous_header_container_name: String = String::new();
 
         for container in &containers {
             let this_container_version = container.container_file_version().unwrap();
             let this_container_name = container.container_name().to_string();
 
-            // Check that container Table Of Contents version matches the previous container
             if previous_container_version.is_none() {
                 previous_container_name = this_container_name.clone();
                 previous_container_version = Some(this_container_version);
@@ -228,23 +250,6 @@ impl IoStoreBackend {
                     previous_container_version.unwrap(),
                     this_container_version
                 );
-            }
-
-            // Check that container header version matches the previous container
-            if let Some(this_container_header_version) = container.container_header_version() {
-                if previous_header_container_version.is_none() {
-                    previous_header_container_name = this_container_name.clone();
-                    previous_header_container_version = Some(this_container_header_version);
-                }
-                if this_container_header_version != previous_header_container_version.unwrap() {
-                    bail!(
-                        "Cannot create composite container for containers of different header versions: Container {} and {} have different versions {:?} and {:?}",
-                        previous_header_container_name,
-                        this_container_name,
-                        previous_header_container_version.unwrap(),
-                        this_container_header_version
-                    );
-                }
             }
         }
 
@@ -321,8 +326,9 @@ pub struct IoStoreContainer {
     path: PathBuf,
     toc: Toc,
     cas: FilePool,
+    config: Arc<Config>,
 
-    container_header: Option<FIoContainerHeader>,
+    container_header: OnceLock<Option<FIoContainerHeader>>,
 }
 impl IoStoreContainer {
     pub fn open<P: AsRef<Path>>(toc_path: P, config: Arc<Config>) -> Result<Self> {
@@ -330,33 +336,34 @@ impl IoStoreContainer {
         let toc: Toc = BufReader::new(fs::File::open(&path)?).de_ctx(config.clone())?;
         let cas = FilePool::new(path.with_extension("ucas"), rayon::max_num_threads())?;
 
-        let mut container = Self {
+        let container = Self {
             name: path.file_stem().context("failed to get container name")?.to_string_lossy().into(),
             path,
             toc,
             cas,
+            config,
 
-            container_header: None,
+            container_header: OnceLock::new(),
         };
-
-        // TODO avoid linear search for header
-        // TODO populate header lazily?
-        let header_chunk = container.chunks().find(|info| info.id().get_chunk_type() == EIoChunkType::ContainerHeader);
-        if let Some(header_chunk) = header_chunk {
-            let chunk_id = header_chunk.id();
-            let data = container.read(chunk_id)?;
-            match FIoContainerHeader::deserialize(&mut std::io::Cursor::new(&data), config.container_header_version_override) {
-                Ok(header) => {
-                    container.container_header = Some(header);
-                }
-                Err(err) => {
-                    eprintln!("Failed to parse ContainerHeader ({chunk_id:?}). Package metadata will be unavailable: {err:?}");
-                }
-            }
-        }
 
         Ok(container)
     }
+
+    /// Lazily load and cache the ContainerHeader on first access.
+    fn get_container_header(&self) -> Option<&FIoContainerHeader> {
+        self.container_header.get_or_init(|| {
+            let header_chunk = self.chunks().find(|info| info.id().get_chunk_type() == EIoChunkType::ContainerHeader)?;
+            let data = self.read(header_chunk.id()).ok()?;
+            match FIoContainerHeader::deserialize(&mut Cursor::new(&data), self.config.container_header_version_override) {
+                Ok(header) => Some(header),
+                Err(err) => {
+                    eprintln!("Failed to parse ContainerHeader ({:?}). Package metadata will be unavailable: {err:?}", header_chunk.id());
+                    None
+                }
+            }
+        }).as_ref()
+    }
+
     #[allow(unused)]
     pub fn container_path(&self) -> &Path {
         self.path.as_ref()
@@ -370,7 +377,7 @@ impl IoStoreTrait for IoStoreContainer {
         Some(self.toc.version)
     }
     fn container_header_version(&self) -> Option<EIoContainerHeaderVersion> {
-        self.container_header.as_ref().map(|x| x.version)
+        self.get_container_header().map(|x| x.version)
     }
     fn print_info(&self, mut depth: usize) {
         indent_println!(depth, "{}", self.container_name());
@@ -385,8 +392,7 @@ impl IoStoreTrait for IoStoreContainer {
         }
         indent_println!(depth, "chunks: {}", self.toc.chunks.len());
         indent_println!(depth, "packages: {}", self.packages().count());
-        // assumes header has already been parsed
-        indent_println!(depth, "container_header_version: {:?}", self.container_header.as_ref().map(|h| h.version));
+        indent_println!(depth, "container_header_version: {:?}", self.get_container_header().map(|h| h.version));
         indent_println!(depth, "compression_methods: {:?}", self.toc.compression_methods);
     }
     fn read(&self, chunk_id: FIoChunkId) -> Result<Vec<u8>> {
@@ -420,7 +426,7 @@ impl IoStoreTrait for IoStoreContainer {
         self.packages_all()
     }
     fn packages_all(&self) -> Box<dyn Iterator<Item = PackageInfo<'_>> + Send + '_> {
-        Box::new(self.container_header.iter().flat_map(|header| header.package_ids()).map(|id| PackageInfo { id, container: self }))
+        Box::new(self.get_container_header().into_iter().flat_map(|header| header.package_ids()).map(|id| PackageInfo { id, container: self }))
     }
     fn child_containers(&self) -> Box<dyn Iterator<Item = &dyn IoStoreTrait> + '_> {
         Box::new(std::iter::empty())
@@ -429,10 +435,10 @@ impl IoStoreTrait for IoStoreContainer {
         self.toc.file_name(chunk_id)
     }
     fn package_store_entry(&self, package_id: FPackageId) -> Option<StoreEntry> {
-        self.container_header.as_ref().and_then(|header| header.get_store_entry(package_id))
+        self.get_container_header().and_then(|header| header.get_store_entry(package_id))
     }
     fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId> {
-        self.container_header.as_ref().and_then(|header| header.lookup_package_redirect(source_package_id))
+        self.get_container_header().and_then(|header| header.lookup_package_redirect(source_package_id))
     }
 }
 
