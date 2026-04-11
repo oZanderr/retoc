@@ -609,7 +609,7 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
 fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
     let manifest: raw::RawIoManifest = serde_json::from_reader(BufReader::new(fs::File::open(args.input.join("manifest.json"))?))?;
 
-    let mut writer = IoStoreWriter::new(args.utoc, manifest.version, None, manifest.mount_point.into())?;
+    let mut writer = IoStoreWriter::new(args.utoc, manifest.version, None, manifest.mount_point.into(), None)?;
     for entry in args.input.join("chunks").read_dir()? {
         let entry = entry?;
         let chunk_id = FIoChunkIdRaw::from_str(entry.file_name().to_string_lossy().as_ref())?;
@@ -774,7 +774,7 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
     let toc_version = config.toc_version_override.unwrap_or(args.version.toc_version());
 
-    let mut writer = IoStoreWriter::new(&args.output, toc_version, Some(container_header_version), mount_point.into())?;
+    let mut writer = IoStoreWriter::new(&args.output, toc_version, Some(container_header_version), mount_point.into(), None)?;
 
     let log = Log::new_stdout(args.verbose, args.debug);
     let mut asset_paths = vec![];
@@ -1053,7 +1053,7 @@ fn action_gen_script_objects(args: ActionGenScriptObjects, _config: Arc<Config>)
         }
     }
 
-    let mut writer = IoStoreWriter::new(&args.output, args.version.toc_version(), None, UEPathBuf::new())?;
+    let mut writer = IoStoreWriter::new(&args.output, args.version.toc_version(), None, UEPathBuf::new(), None)?;
 
     let use_new_format = args.version.toc_version() > EIoStoreTocVersion::PerfectHash;
 

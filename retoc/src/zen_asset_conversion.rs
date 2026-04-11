@@ -106,7 +106,7 @@ fn create_asset_builder<'a>(
     }
 }
 
-fn setup_zen_package_summary(builder: &mut ZenPackageBuilder) -> anyhow::Result<()> {
+fn setup_zen_package_summary(builder: &mut ZenPackageBuilder, ubulk_size: Option<usize>) -> anyhow::Result<()> {
     let is_unversioned = builder.legacy_package.summary.versioning_info.is_unversioned;
 
     // Copy package flags
@@ -164,20 +164,50 @@ fn setup_zen_package_summary(builder: &mut ZenPackageBuilder) -> anyhow::Result<
         builder.zen_package.summary.source_name = builder.zen_package.name_map.store(source_package_name);
     }
 
-    // Copy bulk resources from the legacy package without modifications
-    builder.zen_package.bulk_data = builder
-        .legacy_package
-        .data_resources
-        .iter()
-        .map(|x| FBulkDataMapEntry {
-            serial_offset: x.serial_offset,
-            duplicate_serial_offset: x.duplicate_serial_offset,
-            serial_size: x.serial_size,
-            flags: x.legacy_bulk_data_flags,
-            cooked_index: x.cooked_index.unwrap_or(0),
-            pad: [0, 0, 0],
-        })
-        .collect();
+    // Copy bulk resources from the legacy package, validating offsets against actual ubulk size
+    builder.zen_package.bulk_data = match ubulk_size {
+        Some(ubulk_size) if !builder.legacy_package.data_resources.is_empty() => {
+            let entries_valid = builder.legacy_package.data_resources.iter().all(|r| r.serial_offset >= 0 && r.serial_size >= 0 && r.serial_offset + r.serial_size <= ubulk_size as i64);
+            if entries_valid {
+                builder
+                    .legacy_package
+                    .data_resources
+                    .iter()
+                    .map(|x| FBulkDataMapEntry {
+                        serial_offset: x.serial_offset,
+                        duplicate_serial_offset: x.duplicate_serial_offset,
+                        serial_size: x.serial_size,
+                        flags: x.legacy_bulk_data_flags,
+                        cooked_index: x.cooked_index.unwrap_or(0),
+                        pad: [0, 0, 0],
+                    })
+                    .collect()
+            } else {
+                // Fallback: single entry covering entire ubulk when offsets are invalid
+                vec![FBulkDataMapEntry {
+                    serial_offset: 0,
+                    duplicate_serial_offset: -1,
+                    serial_size: ubulk_size as i64,
+                    flags: 0x00010501,
+                    cooked_index: 0,
+                    pad: [0, 0, 0],
+                }]
+            }
+        }
+        _ => builder
+            .legacy_package
+            .data_resources
+            .iter()
+            .map(|x| FBulkDataMapEntry {
+                serial_offset: x.serial_offset,
+                duplicate_serial_offset: x.duplicate_serial_offset,
+                serial_size: x.serial_size,
+                flags: x.legacy_bulk_data_flags,
+                cooked_index: x.cooked_index.unwrap_or(0),
+                pad: [0, 0, 0],
+            })
+            .collect(),
+    };
     Ok(())
 }
 
@@ -1300,7 +1330,8 @@ fn build_zen_asset_internal<'a>(
     let mut builder = create_asset_builder(legacy_package_header, container_header_version, fixup_legacy_external_arcs, source_package_name, script_objects, script_cells, log);
 
     // Build zen asset data
-    setup_zen_package_summary(&mut builder)?;
+    let ubulk_size = legacy_asset.bulk_data_buffer.as_ref().map(|b| b.len()).filter(|&len| len > 0);
+    setup_zen_package_summary(&mut builder, ubulk_size)?;
     build_zen_import_map(&mut builder)?;
     build_zen_export_map(&mut builder)?;
     build_zen_preload_dependencies(&mut builder)?;

@@ -62,16 +62,8 @@ pub fn open<P: AsRef<Path>>(path: P, config: Arc<Config>) -> Result<Box<dyn IoSt
 
 /// Open a directory of IoStore containers, only including .utoc files whose
 /// stem (file name without extension) passes the given filter.
-pub fn open_filtered<P: AsRef<Path>>(
-    path: P,
-    config: Arc<Config>,
-    filter: impl Fn(&str) -> bool,
-) -> Result<Box<dyn IoStoreTrait>> {
-    Ok(if path.as_ref().is_dir() {
-        Box::new(IoStoreBackend::open_filtered(path, config, filter)?)
-    } else {
-        Box::new(IoStoreContainer::open(path, config)?)
-    })
+pub fn open_filtered<P: AsRef<Path>>(path: P, config: Arc<Config>, filter: impl Fn(&str) -> bool) -> Result<Box<dyn IoStoreTrait>> {
+    Ok(if path.as_ref().is_dir() { Box::new(IoStoreBackend::open_filtered(path, config, filter)?) } else { Box::new(IoStoreContainer::open(path, config)?) })
 }
 
 /// Return an object that can be sorted by to achieve container priority.
@@ -219,17 +211,8 @@ impl IoStoreBackend {
         }
         let mut utoc_paths = Vec::new();
         collect_utocs(dir.as_ref(), &mut utoc_paths)?;
-        utoc_paths.retain(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(&filter)
-        });
-        let mut containers: Vec<Box<dyn IoStoreTrait>> = utoc_paths
-            .into_par_iter()
-            .map(|path| -> Result<Box<dyn IoStoreTrait>> {
-                Ok(Box::new(IoStoreContainer::open(path, config.clone())?))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        utoc_paths.retain(|p| p.file_stem().and_then(|s| s.to_str()).is_some_and(&filter));
+        let mut containers: Vec<Box<dyn IoStoreTrait>> = utoc_paths.into_par_iter().map(|path| -> Result<Box<dyn IoStoreTrait>> { Ok(Box::new(IoStoreContainer::open(path, config.clone())?)) }).collect::<Result<Vec<_>>>()?;
         // Validate that all containers are of the same TOC version
         let mut previous_container_version: Option<EIoStoreTocVersion> = None;
         let mut previous_container_name: String = String::new();
@@ -351,17 +334,19 @@ impl IoStoreContainer {
 
     /// Lazily load and cache the ContainerHeader on first access.
     fn get_container_header(&self) -> Option<&FIoContainerHeader> {
-        self.container_header.get_or_init(|| {
-            let header_chunk = self.chunks().find(|info| info.id().get_chunk_type() == EIoChunkType::ContainerHeader)?;
-            let data = self.read(header_chunk.id()).ok()?;
-            match FIoContainerHeader::deserialize(&mut Cursor::new(&data), self.config.container_header_version_override) {
-                Ok(header) => Some(header),
-                Err(err) => {
-                    eprintln!("Failed to parse ContainerHeader ({:?}). Package metadata will be unavailable: {err:?}", header_chunk.id());
-                    None
+        self.container_header
+            .get_or_init(|| {
+                let header_chunk = self.chunks().find(|info| info.id().get_chunk_type() == EIoChunkType::ContainerHeader)?;
+                let data = self.read(header_chunk.id()).ok()?;
+                match FIoContainerHeader::deserialize(&mut Cursor::new(&data), self.config.container_header_version_override) {
+                    Ok(header) => Some(header),
+                    Err(err) => {
+                        eprintln!("Failed to parse ContainerHeader ({:?}). Package metadata will be unavailable: {err:?}", header_chunk.id());
+                        None
+                    }
                 }
-            }
-        }).as_ref()
+            })
+            .as_ref()
     }
 
     #[allow(unused)]

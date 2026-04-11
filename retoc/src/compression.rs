@@ -31,7 +31,7 @@ pub fn compress<S: Write>(compression: CompressionMethod, input: &[u8], mut outp
             output.write_all(&buf)?;
         }
         CompressionMethod::Oodle => {
-            let buffer = oodle_loader::oodle()?.compress(input, oodle_loader::Compressor::Mermaid, oodle_loader::CompressionLevel::Normal)?;
+            let buffer = oodle_loader::oodle()?.compress(input, oodle_loader::Compressor::Kraken, oodle_loader::CompressionLevel::Normal)?;
             output.write_all(&buffer)?;
         }
     }
