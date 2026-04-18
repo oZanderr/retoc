@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 use std::fmt::{Display, Formatter};
 use std::ops::{Deref, DerefMut};
@@ -258,12 +258,15 @@ impl Writeable for f64 {
     }
 }
 
+// Cap pre-allocation from untrusted lengths
+const MAX_PREALLOC_ELEMENTS: usize = 16 * 1024 * 1024;
+
 #[instrument(skip_all)]
 pub fn read_array<S: Read, T, F>(len: usize, stream: &mut S, mut f: F) -> Result<Vec<T>>
 where
     F: FnMut(&mut S) -> Result<T>,
 {
-    let mut array = Vec::with_capacity(len);
+    let mut array = Vec::with_capacity(len.min(MAX_PREALLOC_ELEMENTS));
     for _ in 0..len {
         array.push(f(stream)?);
     }
@@ -275,9 +278,11 @@ pub fn read_string_data<S: Read>(len: i32, stream: &mut S) -> Result<String> {
     if len < 0 {
         let chars = read_array((-len) as usize, stream, |r| Ok(r.read_u16::<LE>()?))?;
         let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
-        Ok(String::from_utf16(&chars[..length]).unwrap())
+        Ok(String::from_utf16(&chars[..length])?)
     } else {
-        let mut chars = vec![0; len as usize];
+        let cap = (len as usize).min(MAX_PREALLOC_ELEMENTS);
+        let mut chars = Vec::with_capacity(cap);
+        chars.resize(len as usize, 0);
         stream.read_exact(&mut chars)?;
         let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
         Ok(String::from_utf8_lossy(&chars[..length]).into_owned())
@@ -331,9 +336,15 @@ pub fn write_string<S: Write>(stream: &mut S, value: &str) -> Result<()> {
 #[instrument(skip_all)]
 pub fn read_utf8_string<S: Read>(stream: &mut S) -> Result<String> {
     let len: i32 = stream.de()?;
-    let mut chars = vec![0; len as usize];
+    if len < 0 {
+        bail!("read_utf8_string: negative length {len}");
+    }
+    let len = len as usize;
+    let cap = len.min(MAX_PREALLOC_ELEMENTS);
+    let mut chars = Vec::with_capacity(cap);
+    chars.resize(len, 0);
     stream.read_exact(&mut chars)?;
-    Ok(String::from_utf8(chars).unwrap())
+    Ok(String::from_utf8(chars)?)
 }
 
 pub fn write_utf8_string<S: Write>(stream: &mut S, value: &str) -> Result<()> {

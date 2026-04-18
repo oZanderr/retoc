@@ -236,7 +236,9 @@ impl Readable for FIoStoreTocHeader {
         if res.toc_magic != Self::MAGIC {
             bail!("unrecognized TOC magic, this is a .utoc file?")
         }
-        assert_eq!(res.toc_header_size, 0x90);
+        if res.toc_header_size != 0x90 {
+            bail!("unexpected TOC header size: got {}, expected 0x90", res.toc_header_size);
+        }
         Ok(res)
     }
 }
@@ -343,6 +345,13 @@ fn read_directory_index<R: Read>(stream: &mut R, header: &FIoStoreTocHeader, con
 
     if header.container_flags.contains(EIoContainerFlags::Encrypted) {
         use aes::cipher::BlockDecrypt;
+
+        if !buf.len().is_multiple_of(16) {
+            bail!(
+                "encrypted directory index size {} is not a multiple of AES block size 16",
+                buf.len()
+            );
+        }
 
         let key = config.aes_keys.get(&header.encryption_key_guid).context("missing encryption key")?;
         for block in buf.chunks_mut(16) {
@@ -902,7 +911,7 @@ mod chunk_id {
             u64::from_le_bytes(self.id[0..8].try_into().unwrap())
         }
         pub fn get_chunk_type(&self) -> EIoChunkType {
-            EIoChunkType::from_repr(self.id[11] & 0b11_1111).unwrap()
+            EIoChunkType::from_repr(self.id[11] & 0b11_1111).unwrap_or(EIoChunkType::Invalid)
         }
         pub fn get_raw(&self) -> FIoChunkIdRaw {
             let mut id = self.id;
@@ -1283,7 +1292,7 @@ impl EIoChunkType {
                 11 => DerivedData,
                 12 => EditorDerivedData,
                 13 => PackageResource,
-                _ => panic!("invalid chunk type for version >= UE5: {value}"),
+                _ => Invalid,
             }
         } else {
             match value {
@@ -1300,7 +1309,7 @@ impl EIoChunkType {
                 10 => ContainerHeader,
                 11 => ShaderCodeLibrary,
                 12 => ShaderCode,
-                _ => panic!("invalid chunk type for version < UE5: {value}"),
+                _ => Invalid,
             }
         }
     }

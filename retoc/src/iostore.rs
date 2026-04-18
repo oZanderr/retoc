@@ -108,7 +108,9 @@ pub trait IoStoreTrait: Send + Sync {
     fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId>;
 
     fn load_script_objects(&self) -> Result<ZenScriptObjects> {
-        if self.container_file_version().unwrap() > EIoStoreTocVersion::PerfectHash {
+        let version = self.container_file_version()
+            .context("container has no known TOC version, cannot load script objects")?;
+        if version > EIoStoreTocVersion::PerfectHash {
             let script_objects_data = self.read(FIoChunkId::create(0, 0, EIoChunkType::ScriptObjects))?;
             ZenScriptObjects::deserialize_new(&mut Cursor::new(script_objects_data))
         } else {
@@ -218,21 +220,25 @@ impl IoStoreBackend {
         let mut previous_container_name: String = String::new();
 
         for container in &containers {
-            let this_container_version = container.container_file_version().unwrap();
             let this_container_name = container.container_name().to_string();
+            let this_container_version = container.container_file_version()
+                .with_context(|| format!("container {this_container_name} has no known TOC version"))?;
 
-            if previous_container_version.is_none() {
-                previous_container_name = this_container_name.clone();
-                previous_container_version = Some(this_container_version);
-            }
-            if this_container_version != previous_container_version.unwrap() {
-                bail!(
-                    "Cannot create composite container for containers of different versions: Container {} and {} have different versions {:?} and {:?}",
-                    previous_container_name,
-                    this_container_name,
-                    previous_container_version.unwrap(),
-                    this_container_version
-                );
+            match previous_container_version {
+                None => {
+                    previous_container_name = this_container_name.clone();
+                    previous_container_version = Some(this_container_version);
+                }
+                Some(prev) if prev != this_container_version => {
+                    bail!(
+                        "Cannot create composite container for containers of different versions: Container {} and {} have different versions {:?} and {:?}",
+                        previous_container_name,
+                        this_container_name,
+                        prev,
+                        this_container_version
+                    );
+                }
+                _ => {}
             }
         }
 
