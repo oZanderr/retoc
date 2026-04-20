@@ -80,7 +80,7 @@ impl ECbFieldTypeFlags {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct Field {
+pub struct Field {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(flatten)]
@@ -90,7 +90,7 @@ struct Field {
 #[serde_as]
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-enum FieldValue {
+pub enum FieldValue {
     Null,
     Object(IndexMap<String, FieldValue>),
     UniformObject(IndexMap<String, FieldValue>),

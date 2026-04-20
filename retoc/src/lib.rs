@@ -340,26 +340,51 @@ fn read_chunk_block_signatures<R: Read>(stream: &mut R, header: &FIoStoreTocHead
 }
 
 #[instrument(skip_all)]
-fn read_directory_index<R: Read>(stream: &mut R, header: &FIoStoreTocHeader, config: &Config) -> Result<Vec<u8>> {
-    let mut buf: Vec<u8> = stream.de_ctx(header.directory_index_size as usize)?;
+fn read_directory_index<R: Read>(stream: &mut R, header: &FIoStoreTocHeader, config: &Config) -> Result<FIoDirectoryIndexResource> {
+    let size = header.directory_index_size as usize;
+    if size == 0 {
+        return Ok(FIoDirectoryIndexResource::default());
+    }
 
-    if header.container_flags.contains(EIoContainerFlags::Encrypted) {
-        use aes::cipher::BlockDecrypt;
+    let raw: Vec<u8> = stream.de_ctx(size)?;
 
-        if !buf.len().is_multiple_of(16) {
-            bail!(
-                "encrypted directory index size {} is not a multiple of AES block size 16",
-                buf.len()
-            );
-        }
+    // Guard against garbage bytes that deserialize into a structurally valid
+    // resource; real mount points start with "../" or "/".
+    let is_valid = |res: &FIoDirectoryIndexResource| -> bool {
+        let mount = res.mount_point.as_str();
+        mount.starts_with("../") || mount.starts_with('/')
+    };
 
+    if !header.container_flags.contains(EIoContainerFlags::Encrypted) {
+        let resource = FIoDirectoryIndexResource::de(&mut Cursor::new(&raw))?;
+        return Ok(resource);
+    }
+
+    use aes::cipher::BlockDecrypt;
+
+    // Decrypt path requires block-aligned size. Some mods set the Encrypted
+    // flag but store a plaintext index of arbitrary length, so fall through
+    // to the raw parse below when alignment fails.
+    if size.is_multiple_of(16) {
         let key = config.aes_keys.get(&header.encryption_key_guid).context("missing encryption key")?;
-        for block in buf.chunks_mut(16) {
+        let mut decrypted = raw.clone();
+        for block in decrypted.chunks_mut(16) {
             key.0.decrypt_block(block.into());
+        }
+        if let Ok(resource) = FIoDirectoryIndexResource::de(&mut Cursor::new(&decrypted))
+            && is_valid(&resource)
+        {
+            return Ok(resource);
         }
     }
 
-    Ok(buf)
+    if let Ok(resource) = FIoDirectoryIndexResource::de(&mut Cursor::new(&raw))
+        && is_valid(&resource)
+    {
+        return Ok(resource);
+    }
+
+    bail!("directory index parse failed both decrypted and as plaintext (mount validation)")
 }
 
 #[instrument(skip_all)]
@@ -494,7 +519,6 @@ impl ReadableCtx<Arc<Config>> for Toc {
         let mut file_map: HashMap<String, u32> = Default::default();
         let mut file_map_lower: HashMap<String, u32> = Default::default();
         let mut file_map_rev: HashMap<u32, String> = Default::default();
-        let directory_index = if !directory_index.is_empty() { FIoDirectoryIndexResource::de(&mut Cursor::new(directory_index))? } else { FIoDirectoryIndexResource::default() };
         directory_index.iter_root(|user_data, path| {
             let path = path.join("/");
             file_map_lower.insert(path.to_ascii_lowercase(), user_data);
@@ -531,6 +555,28 @@ impl ReadableCtx<Arc<Config>> for Toc {
         })
     }
 }
+/// Return mount-joined paths from a TOC's directory index. Stops after the
+/// index, so callers see every listed asset even when later sections
+/// (chunk metadata, signatures) are malformed or missing.
+pub fn read_toc_paths<R: Read>(stream: &mut R, config: Arc<Config>) -> Result<Vec<String>> {
+    let header: FIoStoreTocHeader = stream.de()?;
+    let _chunk_ids = read_chunk_ids(stream, &header)?;
+    let _chunk_offsets = read_chunk_offsets(stream, &header)?;
+    let _hash = read_hash_map(stream, &header)?;
+    let _compression_blocks = read_compression_blocks(stream, &header)?;
+    let _compression_methods = read_compression_methods(stream, &header)?;
+    let _signatures = read_chunk_block_signatures(stream, &header)?;
+    let directory_index = read_directory_index(stream, &header, &config)?;
+
+    let mut paths: Vec<String> = Vec::new();
+    let mount_point = directory_index.mount_point.clone();
+    directory_index.iter_root(|_user_data, path| {
+        let joined = path.join("/");
+        paths.push(UEPath::new(&mount_point).join(joined).to_string());
+    });
+    Ok(paths)
+}
+
 impl Writeable for Toc {
     fn ser<S: Write>(&self, s: &mut S) -> Result<()> {
         let mut container_flags = EIoContainerFlags::empty();
