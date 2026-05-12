@@ -217,7 +217,7 @@ fn decompress_shader_code(shader_group_data: &[u8], compression_method: &mut Opt
 
 fn compress_shader(shader_data: &[u8], compression_method: CompressionMethod) -> anyhow::Result<Vec<u8>> {
     let mut compression_buffer: Vec<u8> = Vec::with_capacity(shader_data.len());
-    compress(compression_method, shader_data, Cursor::new(&mut compression_buffer))?;
+    compress(compression_method, None, shader_data, Cursor::new(&mut compression_buffer))?;
     Ok(compression_buffer)
 }
 

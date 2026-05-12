@@ -7,6 +7,8 @@ use crate::{
 use crate::{EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoContainerId, FIoOffsetAndLength, FIoStoreTocCompressedBlockEntry, FIoStoreTocEntryMeta, FIoStoreTocEntryMetaFlags, Toc, ser::*};
 use anyhow::{Context, Result};
 use fs_err as fs;
+use oodle_loader::CompressionLevel;
+use rayon::prelude::*;
 use std::io::Cursor;
 use std::{
     io::{BufWriter, Seek, Write},
@@ -21,6 +23,7 @@ pub struct IoStoreWriter {
     toc: Toc,
     container_header: Option<FIoContainerHeader>,
     compression_method: Option<CompressionMethod>,
+    compression_level: Option<CompressionLevel>,
 }
 
 impl IoStoreWriter {
@@ -50,7 +53,14 @@ impl IoStoreWriter {
             toc,
             container_header,
             compression_method,
+            compression_level: None,
         })
+    }
+    /// Builder-style override for the Oodle compression level used by chunk writes.
+    /// Only applies when `compression_method` is `Some(CompressionMethod::Oodle)`.
+    pub fn with_compression_level(mut self, level: CompressionLevel) -> Self {
+        self.compression_level = Some(level);
+        self
     }
     pub fn write_chunk_raw(&mut self, chunk_id_raw: FIoChunkIdRaw, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
         self.write_chunk_inner(FIoChunkId::from_raw(chunk_id_raw, self.toc.version), path, data, true)
@@ -76,32 +86,45 @@ impl IoStoreWriter {
         // compression_method_index: 0 = None, 1 = first entry in compression_methods vec
         let compression_method_index: u8 = if active_compression.is_some() { 1 } else { 0 };
 
+        let block_size = self.toc.compression_block_size as usize;
+        let blocks: Vec<&[u8]> = data.chunks(block_size).collect();
+        let level = self.compression_level;
+
+        // Compress each block independently across rayon threads. Output ordering
+        // preserved by indexed Vec; the sequential write loop below restores serial
+        // append into the cas stream.
+        let compressed: Vec<(Vec<u8>, u8)> = if let Some(method) = active_compression {
+            blocks
+                .par_iter()
+                .map(|block| -> Result<(Vec<u8>, u8)> {
+                    let mut buf = Vec::new();
+                    compression::compress(method, level, block, &mut buf)?;
+                    if buf.len() < block.len() {
+                        Ok((buf, compression_method_index))
+                    } else {
+                        Ok((block.to_vec(), 0))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            blocks.iter().map(|block| (block.to_vec(), 0)).collect()
+        };
+
+        // Hash the full payload in one pass. blake3 is SIMD-accelerated; faster than
+        // per-block update accumulation in practice.
+        let hash = blake3::hash(data);
+
         let mut any_block_compressed = false;
-        let mut hasher = blake3::Hasher::new();
-        for block in data.chunks(self.toc.compression_block_size as usize) {
-            hasher.update(block);
-
-            let (written_bytes, actual_method_index) = if let Some(method) = active_compression {
-                let mut compressed = Vec::new();
-                compression::compress(method, block, &mut compressed)?;
-                // only use compressed if actually smaller
-                if compressed.len() < block.len() {
-                    any_block_compressed = true;
-                    (compressed, compression_method_index)
-                } else {
-                    (block.to_vec(), 0)
-                }
-            } else {
-                (block.to_vec(), 0)
-            };
-
-            self.cas_stream.write_all(&written_bytes)?;
+        for (i, (written_bytes, actual_method_index)) in compressed.iter().enumerate() {
+            self.cas_stream.write_all(written_bytes)?;
             let compressed_size = written_bytes.len() as u32;
-            let uncompressed_size = block.len() as u32;
-            self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(offset, compressed_size, uncompressed_size, actual_method_index));
+            let uncompressed_size = blocks[i].len() as u32;
+            if *actual_method_index != 0 {
+                any_block_compressed = true;
+            }
+            self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(offset, compressed_size, uncompressed_size, *actual_method_index));
             offset += compressed_size as u64;
         }
-        let hash = hasher.finalize();
         let flags = if any_block_compressed { FIoStoreTocEntryMetaFlags::Compressed } else { FIoStoreTocEntryMetaFlags::empty() };
         let meta = FIoStoreTocEntryMeta {
             chunk_hash: FIoChunkHash::from_blake3(hash.as_bytes()),

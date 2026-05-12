@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use oodle_loader::CompressionLevel;
 use std::io::{Read as _, Write};
 use strum::{AsRefStr, EnumString, VariantArray};
 
@@ -15,7 +16,12 @@ impl CompressionMethod {
     }
 }
 
-pub fn compress<S: Write>(compression: CompressionMethod, input: &[u8], mut output: S) -> Result<()> {
+pub fn compress<S: Write>(
+    compression: CompressionMethod,
+    level: Option<CompressionLevel>,
+    input: &[u8],
+    mut output: S,
+) -> Result<()> {
     match compression {
         CompressionMethod::Zlib => {
             let mut encoder = flate2::write::ZlibEncoder::new(output, flate2::Compression::best());
@@ -31,7 +37,8 @@ pub fn compress<S: Write>(compression: CompressionMethod, input: &[u8], mut outp
             output.write_all(&buf)?;
         }
         CompressionMethod::Oodle => {
-            let buffer = oodle_loader::oodle()?.compress(input, oodle_loader::Compressor::Kraken, oodle_loader::CompressionLevel::Normal)?;
+            let lvl = level.unwrap_or(CompressionLevel::Normal);
+            let buffer = oodle_loader::oodle()?.compress(input, oodle_loader::Compressor::Kraken, lvl)?;
             output.write_all(&buffer)?;
         }
     }

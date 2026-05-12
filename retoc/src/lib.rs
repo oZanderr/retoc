@@ -21,6 +21,7 @@ pub mod zen;
 pub mod zen_asset_conversion;
 
 pub use anyhow;
+pub use oodle_loader::CompressionLevel as OodleCompressionLevel;
 
 use anyhow::{Context, Result, bail};
 use bitflags::bitflags;
