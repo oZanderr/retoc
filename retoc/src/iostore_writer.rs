@@ -90,40 +90,45 @@ impl IoStoreWriter {
         let blocks: Vec<&[u8]> = data.chunks(block_size).collect();
         let level = self.compression_level;
 
-        // Compress each block independently across rayon threads. Output ordering
-        // preserved by indexed Vec; the sequential write loop below restores serial
-        // append into the cas stream.
-        let compressed: Vec<(Vec<u8>, u8)> = if let Some(method) = active_compression {
-            blocks
-                .par_iter()
-                .map(|block| -> Result<(Vec<u8>, u8)> {
-                    let mut buf = Vec::new();
-                    compression::compress(method, level, block, &mut buf)?;
-                    if buf.len() < block.len() {
-                        Ok((buf, compression_method_index))
-                    } else {
-                        Ok((block.to_vec(), 0))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            blocks.iter().map(|block| (block.to_vec(), 0)).collect()
-        };
-
         // Hash the full payload in one pass. blake3 is SIMD-accelerated; faster than
         // per-block update accumulation in practice.
         let hash = blake3::hash(data);
 
+        // Slab compress so the per-chunk scratch is bounded; sized at 2 blocks
+        // per worker to amortize rayon dispatch without over-buffering.
+        let slab_blocks = rayon::current_num_threads()
+            .max(1)
+            .saturating_mul(2)
+            .min(blocks.len().max(1));
+
         let mut any_block_compressed = false;
-        for (i, (written_bytes, actual_method_index)) in compressed.iter().enumerate() {
-            self.cas_stream.write_all(written_bytes)?;
-            let compressed_size = written_bytes.len() as u32;
-            let uncompressed_size = blocks[i].len() as u32;
-            if *actual_method_index != 0 {
-                any_block_compressed = true;
+        for slab in blocks.chunks(slab_blocks) {
+            let compressed: Vec<(Vec<u8>, u8)> = if let Some(method) = active_compression {
+                slab.par_iter()
+                    .map(|block| -> Result<(Vec<u8>, u8)> {
+                        let mut buf = Vec::new();
+                        compression::compress(method, level, block, &mut buf)?;
+                        if buf.len() < block.len() {
+                            Ok((buf, compression_method_index))
+                        } else {
+                            Ok((block.to_vec(), 0))
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                slab.iter().map(|block| (block.to_vec(), 0)).collect()
+            };
+
+            for ((written_bytes, actual_method_index), block) in compressed.iter().zip(slab.iter()) {
+                self.cas_stream.write_all(written_bytes)?;
+                let compressed_size = written_bytes.len() as u32;
+                let uncompressed_size = block.len() as u32;
+                if *actual_method_index != 0 {
+                    any_block_compressed = true;
+                }
+                self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(offset, compressed_size, uncompressed_size, *actual_method_index));
+                offset += compressed_size as u64;
             }
-            self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(offset, compressed_size, uncompressed_size, *actual_method_index));
-            offset += compressed_size as u64;
         }
         let flags = if any_block_compressed { FIoStoreTocEntryMetaFlags::Compressed } else { FIoStoreTocEntryMetaFlags::empty() };
         let meta = FIoStoreTocEntryMeta {
