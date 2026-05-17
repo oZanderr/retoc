@@ -1309,6 +1309,22 @@ impl ConvertedZenAssetBundle {
         self.memory_mapped_bulk_data_buffer = None;
         Ok(())
     }
+
+    pub fn mounted_path(&self) -> &UEPath {
+        &self.path
+    }
+
+    pub fn take_bulk_data(&mut self) -> Option<Vec<u8>> {
+        self.bulk_data_buffer.take()
+    }
+
+    pub fn take_optional_bulk_data(&mut self) -> Option<Vec<u8>> {
+        self.optional_bulk_data_buffer.take()
+    }
+
+    pub fn take_memory_mapped_bulk_data(&mut self) -> Option<Vec<u8>> {
+        self.memory_mapped_bulk_data_buffer.take()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
