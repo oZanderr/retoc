@@ -62,6 +62,12 @@ impl IoStoreWriter {
         self.compression_level = Some(level);
         self
     }
+    /// Override the TOC compression block size. Default is 128 KiB. Some games (e.g. Marvel Rivals)
+    /// ship with 64 KiB; the runtime sizes its streaming buffers from this field, so writes must match.
+    pub fn with_compression_block_size(mut self, size: u32) -> Self {
+        self.toc.compression_block_size = size;
+        self
+    }
     pub fn write_chunk_raw(&mut self, chunk_id_raw: FIoChunkIdRaw, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
         self.write_chunk_inner(FIoChunkId::from_raw(chunk_id_raw, self.toc.version), path, data, true)
     }

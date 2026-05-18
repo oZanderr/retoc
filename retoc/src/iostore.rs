@@ -91,6 +91,7 @@ pub trait IoStoreTrait: Send + Sync {
     fn container_name(&self) -> &str;
     fn container_file_version(&self) -> Option<EIoStoreTocVersion>;
     fn container_header_version(&self) -> Option<EIoContainerHeaderVersion>;
+    fn compression_block_size(&self) -> Option<u32>;
     fn print_info(&self, depth: usize);
 
     fn read(&self, chunk_id: FIoChunkId) -> Result<Vec<u8>>;
@@ -253,6 +254,9 @@ impl IoStoreTrait for IoStoreBackend {
     fn container_file_version(&self) -> Option<EIoStoreTocVersion> {
         self.containers.first().and_then(|x| x.container_file_version())
     }
+    fn compression_block_size(&self) -> Option<u32> {
+        self.containers.first().and_then(|x| x.compression_block_size())
+    }
     fn container_header_version(&self) -> Option<EIoContainerHeaderVersion> {
         // Some containers might not have a container header, so take the first container with a header
         self.containers.iter().find_map(|x| x.container_header_version())
@@ -366,6 +370,9 @@ impl IoStoreTrait for IoStoreContainer {
     }
     fn container_file_version(&self) -> Option<EIoStoreTocVersion> {
         Some(self.toc.version)
+    }
+    fn compression_block_size(&self) -> Option<u32> {
+        Some(self.toc.compression_block_size)
     }
     fn container_header_version(&self) -> Option<EIoContainerHeaderVersion> {
         self.get_container_header().map(|x| x.version)
