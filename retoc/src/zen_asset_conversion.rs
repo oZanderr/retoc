@@ -106,7 +106,7 @@ fn create_asset_builder<'a>(
     }
 }
 
-fn setup_zen_package_summary(builder: &mut ZenPackageBuilder, ubulk_size: Option<usize>) -> anyhow::Result<()> {
+fn setup_zen_package_summary(builder: &mut ZenPackageBuilder, _ubulk_size: Option<usize>) -> anyhow::Result<()> {
     let is_unversioned = builder.legacy_package.summary.versioning_info.is_unversioned;
 
     // Copy package flags
@@ -164,50 +164,22 @@ fn setup_zen_package_summary(builder: &mut ZenPackageBuilder, ubulk_size: Option
         builder.zen_package.summary.source_name = builder.zen_package.name_map.store(source_package_name);
     }
 
-    // Copy bulk resources from the legacy package, validating offsets against actual ubulk size
-    builder.zen_package.bulk_data = match ubulk_size {
-        Some(ubulk_size) if !builder.legacy_package.data_resources.is_empty() => {
-            let entries_valid = builder.legacy_package.data_resources.iter().all(|r| r.serial_offset >= 0 && r.serial_size >= 0 && r.serial_offset + r.serial_size <= ubulk_size as i64);
-            if entries_valid {
-                builder
-                    .legacy_package
-                    .data_resources
-                    .iter()
-                    .map(|x| FBulkDataMapEntry {
-                        serial_offset: x.serial_offset,
-                        duplicate_serial_offset: x.duplicate_serial_offset,
-                        serial_size: x.serial_size,
-                        flags: x.legacy_bulk_data_flags,
-                        cooked_index: x.cooked_index.unwrap_or(0),
-                        pad: [0, 0, 0],
-                    })
-                    .collect()
-            } else {
-                // Fallback: single entry covering entire ubulk when offsets are invalid
-                vec![FBulkDataMapEntry {
-                    serial_offset: 0,
-                    duplicate_serial_offset: -1,
-                    serial_size: ubulk_size as i64,
-                    flags: 0x00010501,
-                    cooked_index: 0,
-                    pad: [0, 0, 0],
-                }]
-            }
-        }
-        _ => builder
-            .legacy_package
-            .data_resources
-            .iter()
-            .map(|x| FBulkDataMapEntry {
-                serial_offset: x.serial_offset,
-                duplicate_serial_offset: x.duplicate_serial_offset,
-                serial_size: x.serial_size,
-                flags: x.legacy_bulk_data_flags,
-                cooked_index: x.cooked_index.unwrap_or(0),
-                pad: [0, 0, 0],
-            })
-            .collect(),
-    };
+    // Preserve every data_resources entry 1:1. The old offset-check + single-entry fallback
+    // stripped per-payload flags (notably BULKDATA_SingleUse 0x08), so transient bulks stayed
+    // resident at runtime and OOMed the game.
+    builder.zen_package.bulk_data = builder
+        .legacy_package
+        .data_resources
+        .iter()
+        .map(|x| FBulkDataMapEntry {
+            serial_offset: x.serial_offset,
+            duplicate_serial_offset: x.duplicate_serial_offset,
+            serial_size: x.serial_size,
+            flags: x.legacy_bulk_data_flags,
+            cooked_index: x.cooked_index.unwrap_or(0),
+            pad: [0, 0, 0],
+        })
+        .collect();
     Ok(())
 }
 
@@ -252,6 +224,25 @@ fn resolve_legacy_package_object(package: &ZenPackageBuilder, object_index: FPac
 
 fn convert_legacy_import_to_object_index(builder: &mut ZenPackageBuilder, import_index: usize) -> anyhow::Result<FPackageObjectIndex> {
     let (package_name, full_import_name) = resolve_legacy_package_object(builder, FPackageIndex::create_import(import_index as u32))?;
+
+    // Restore an import that extraction could not resolve and preserved by encoding the raw export
+    // hash in the object name (see asset_conversion::try_preserve_unresolved_package_import).
+    let object_path = full_import_name.get(package_name.len() + 1..).unwrap_or("");
+    if builder.container_header_version > EIoContainerHeaderVersion::Initial
+        && let Some(hex) = object_path.strip_prefix(crate::asset_conversion::UNRESOLVED_EXPORT_HASH_PREFIX)
+        && let Ok(export_hash) = u64::from_str_radix(hex, 16)
+    {
+        let package_id = FPackageId::from_name(&package_name);
+        let import_reference = resolve_zen_package_import(builder, package_id, &package_name, export_hash);
+        return Ok(FPackageObjectIndex::create_package_import(import_reference));
+    }
+
+    // /Engine/UnknownPackage is the extraction sentinel for an unresolvable import; emitting it as
+    // a real PackageImport fatal-asserts in UE's loader, so map it to Null (the loader's standard
+    // "missing reference" signal) instead.
+    if package_name.eq_ignore_ascii_case("/Engine/UnknownPackage") {
+        return Ok(FPackageObjectIndex::create_null());
+    }
 
     // If this is a script import, just resolve it directly using the full import name as an index into script objects
     let is_script_import = package_name.starts_with("/Script/");
@@ -1195,6 +1186,15 @@ pub struct ConvertedZenAssetBundle {
 impl ConvertedZenAssetBundle {
     pub fn package_data_size(&self) -> usize {
         self.package_buffer.len()
+    }
+    /// Container-header store entry this package contributes.
+    pub fn store_entry(&self) -> &StoreEntry {
+        &self.store_entry
+    }
+    /// Override the store entry's shader map hashes. Used by hosts that need to restore per-package
+    /// shader linkage when the source shaders live in a different container than the one being built.
+    pub fn set_shader_map_hashes(&mut self, hashes: Vec<FSHAHash>) {
+        self.store_entry.shader_map_hashes = hashes;
     }
     pub fn fixup_legacy_external_arcs(&mut self, global_package_lookup: &HashMap<FPackageId, Arc<RwLock<ConvertedZenAssetBundle>>>, log: &Log) -> anyhow::Result<()> {
         for legacy_serialized_offset in &self.legacy_external_arc_serialized_offsets {

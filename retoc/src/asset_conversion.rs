@@ -679,12 +679,20 @@ fn build_import_map(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
             }
             builder.has_failed_import_map_entries = true;
 
-            // Insert the entry into the import map, and associate this import index with the null import
-            let null_package_import = create_and_add_unknown_package_import(builder);
-            let import_map_index = FPackageIndex::create_import(builder.legacy_package.imports.len() as u32);
-            let null_object_import = create_unknown_object_import_map_entry(builder, null_package_import);
-
-            builder.legacy_package.imports.push(null_object_import);
+            // Preserve the real reference if we still have the package name + export hash;
+            // /Engine/UnknownPackage is the fallback and UE's loader fatal-asserts on that name.
+            let import_map_index = if let Some(index) =
+                try_preserve_unresolved_package_import(builder, import_object_index)
+            {
+                index
+            } else {
+                let null_package_import = create_and_add_unknown_package_import(builder);
+                let index = FPackageIndex::create_import(builder.legacy_package.imports.len() as u32);
+                let null_object_import =
+                    create_unknown_object_import_map_entry(builder, null_package_import);
+                builder.legacy_package.imports.push(null_object_import);
+                index
+            };
             builder.zen_import_lookup.insert(import_object_index, import_map_index);
             import_map_index
         } else {
@@ -1246,6 +1254,66 @@ fn create_and_add_unknown_package_import(builder: &mut LegacyAssetBuilder) -> FP
     builder.legacy_package.imports.push(new_import_entry);
     FPackageIndex::create_import(new_import_index as u32)
 }
+
+/// Object-import name prefix carrying a raw zen public-export hash through the legacy form so the
+/// legacy->zen rebuild can reconstruct an unresolved import without emitting /Engine/UnknownPackage
+/// (UE's loader fatal-asserts on that name).
+pub(crate) const UNRESOLVED_EXPORT_HASH_PREFIX: &str = "__zenrawexporthash_";
+
+/// Emit a real package import + an object import whose name encodes the raw export hash, so the
+/// rebuild can decode it back to the exact reference. Returns None when the import lacks a usable
+/// package name; caller falls back to /Engine/UnknownPackage.
+fn try_preserve_unresolved_package_import(
+    builder: &mut LegacyAssetBuilder,
+    import: FPackageObjectIndex,
+) -> Option<FPackageIndex> {
+    let package_import = import.package_import()?;
+    let package_index = package_import.imported_package_index as usize;
+    let hash_index = package_import.imported_public_export_hash_index as usize;
+    if package_index >= builder.zen_package.imported_package_names.len()
+        || hash_index >= builder.zen_package.imported_public_export_hashes.len()
+    {
+        return None;
+    }
+    let package_name = builder.zen_package.imported_package_names[package_index].clone();
+    if package_name.is_empty() || package_name.starts_with("/Script/") {
+        return None;
+    }
+    let export_hash = builder.zen_package.imported_public_export_hashes[hash_index];
+
+    // The package itself.
+    let pkg_class_package = builder.legacy_package.name_map.store(CORE_OBJECT_PACKAGE_NAME);
+    let pkg_class_name = builder.legacy_package.name_map.store(PACKAGE_CLASS_NAME);
+    let pkg_object_name = builder.legacy_package.name_map.store(&package_name);
+    builder.legacy_package.imports.push(FObjectImport {
+        class_package: pkg_class_package,
+        class_name: pkg_class_name,
+        outer_index: FPackageIndex::create_null(),
+        object_name: pkg_object_name,
+        is_optional: false,
+    });
+    let package_import_index =
+        FPackageIndex::create_import((builder.legacy_package.imports.len() - 1) as u32);
+
+    // Object import carrying the raw export hash in its name.
+    let obj_class_package = builder.legacy_package.name_map.store(CORE_OBJECT_PACKAGE_NAME);
+    let obj_class_name = builder.legacy_package.name_map.store(OBJECT_CLASS_NAME);
+    let obj_object_name = builder
+        .legacy_package
+        .name_map
+        .store(&format!("{UNRESOLVED_EXPORT_HASH_PREFIX}{export_hash:016x}"));
+    builder.legacy_package.imports.push(FObjectImport {
+        class_package: obj_class_package,
+        class_name: obj_class_name,
+        outer_index: package_import_index,
+        object_name: obj_object_name,
+        is_optional: false,
+    });
+    Some(FPackageIndex::create_import(
+        (builder.legacy_package.imports.len() - 1) as u32,
+    ))
+}
+
 fn create_unknown_object_import_map_entry(builder: &mut LegacyAssetBuilder, outer_index: FPackageIndex) -> FObjectImport {
     let class_package = builder.legacy_package.name_map.store(CORE_OBJECT_PACKAGE_NAME);
     let class_name = builder.legacy_package.name_map.store(OBJECT_CLASS_NAME);
