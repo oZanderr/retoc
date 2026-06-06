@@ -74,7 +74,7 @@ impl IoStoreWriter {
     pub fn write_chunk(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
         self.write_chunk_inner(chunk_id, path, data, true)
     }
-    fn write_chunk_uncompressed(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
+    pub fn write_chunk_uncompressed(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
         self.write_chunk_inner(chunk_id, path, data, false)
     }
     fn write_chunk_inner(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8], compress: bool) -> Result<()> {
@@ -155,6 +155,13 @@ impl IoStoreWriter {
         let container_header = self.container_header.as_mut().expect("FIoContainerHeader is required to write package chunks");
         container_header.add_package(FPackageId(chunk_id.get_chunk_id()), store_entry.clone());
         self.write_chunk(chunk_id, path, data)
+    }
+    /// Same as `write_package_chunk` but stores the export-bundle chunk uncompressed, preserving a
+    /// source container's decision to ship a package raw. Header linkage is identical.
+    pub fn write_package_chunk_uncompressed(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8], store_entry: &StoreEntry) -> Result<()> {
+        let container_header = self.container_header.as_mut().expect("FIoContainerHeader is required to write package chunks");
+        container_header.add_package(FPackageId(chunk_id.get_chunk_id()), store_entry.clone());
+        self.write_chunk_uncompressed(chunk_id, path, data)
     }
     pub fn add_localized_package(&mut self, package_culture: &str, source_package_name: &str, localized_package_id: FPackageId) -> Result<()> {
         let container_header = self.container_header.as_mut().expect("FIoContainerHeader is required to add localized packages");

@@ -11,7 +11,8 @@ use fs_err as fs;
 use rayon::prelude::*;
 
 use crate::{
-    Config, EIoChunkType, EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FPackageId, Toc,
+    Config, EIoChunkType, EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoStoreTocEntryMetaFlags,
+    FPackageId, Toc,
     chunk_id::FIoChunkIdRaw,
     container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry},
     file_pool::FilePool,
@@ -146,6 +147,13 @@ impl ChunkInfo<'_> {
     }
     pub fn hash(&self) -> &FIoChunkHash {
         &self.container.toc.chunk_metas[self.toc_index() as usize].chunk_hash
+    }
+    /// Whether this chunk is stored compressed on disk (vs. raw). Lets callers reproduce a
+    /// source container's per-chunk compression decision when rebuilding.
+    pub fn is_compressed(&self) -> bool {
+        self.container.toc.chunk_metas[self.toc_index() as usize]
+            .flags
+            .contains(FIoStoreTocEntryMetaFlags::Compressed)
     }
     pub fn read(&self) -> Result<Vec<u8>> {
         self.container.read(self.id)
