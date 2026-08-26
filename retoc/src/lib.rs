@@ -586,6 +586,11 @@ impl Writeable for Toc {
         if !self.compression_methods.is_empty() {
             container_flags |= EIoContainerFlags::Compressed;
         }
+        // Propagated one bit at a time: carrying the whole set over would resurrect Signed on a
+        // container we never wrote signature blocks for.
+        if self.container_flags.contains(EIoContainerFlags::Encrypted) {
+            container_flags |= EIoContainerFlags::Encrypted;
+        }
         let mut directory_index_buffer = vec![];
         self.directory_index.ser(&mut Cursor::new(&mut directory_index_buffer))?;
         // TODO encrypt directory index

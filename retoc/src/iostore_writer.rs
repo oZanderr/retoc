@@ -4,7 +4,7 @@ use crate::{
     compression::{self, CompressionMethod},
     container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry},
 };
-use crate::{EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoContainerId, FIoOffsetAndLength, FIoStoreTocCompressedBlockEntry, FIoStoreTocEntryMeta, FIoStoreTocEntryMetaFlags, Toc, ser::*};
+use crate::{AesKey, EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoContainerId, FIoOffsetAndLength, FIoStoreTocCompressedBlockEntry, FIoStoreTocEntryMeta, FIoStoreTocEntryMetaFlags, Toc, ser::*};
 use anyhow::{Context, Result};
 use fs_err as fs;
 use oodle_loader::CompressionLevel;
@@ -24,6 +24,7 @@ pub struct IoStoreWriter {
     container_header: Option<FIoContainerHeader>,
     compression_method: Option<CompressionMethod>,
     compression_level: Option<CompressionLevel>,
+    encryption: Option<AesKey>,
 }
 
 impl IoStoreWriter {
@@ -54,6 +55,7 @@ impl IoStoreWriter {
             container_header,
             compression_method,
             compression_level: None,
+            encryption: None,
         })
     }
     /// Builder-style override for the Oodle compression level used by chunk writes.
@@ -66,6 +68,15 @@ impl IoStoreWriter {
     /// ship with 64 KiB; the runtime sizes its streaming buffers from this field, so writes must match.
     pub fn with_compression_block_size(mut self, size: u32) -> Self {
         self.toc.compression_block_size = size;
+        self
+    }
+    /// Encrypt every written block with `key` and flag the container as encrypted, leaving the key
+    /// GUID at the default so readers reach for the default-GUID key. Marvel Rivals mods use the
+    /// game's own key here as obfuscation: the runtime decrypts transparently, other readers see
+    /// ciphertext.
+    pub fn with_encryption(mut self, key: AesKey) -> Self {
+        self.toc.container_flags |= crate::EIoContainerFlags::Encrypted;
+        self.encryption = Some(key);
         self
     }
     pub fn write_chunk_raw(&mut self, chunk_id_raw: FIoChunkIdRaw, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
@@ -126,14 +137,31 @@ impl IoStoreWriter {
             };
 
             for ((written_bytes, actual_method_index), block) in compressed.iter().zip(slab.iter()) {
-                self.cas_stream.write_all(written_bytes)?;
                 let compressed_size = written_bytes.len() as u32;
                 let uncompressed_size = block.len() as u32;
                 if *actual_method_index != 0 {
                     any_block_compressed = true;
                 }
+                // Encrypted blocks are stored padded out to the AES block size while the entry
+                // keeps the unpadded length, which is what the read path aligns back up.
+                let stored_size = match &self.encryption {
+                    Some(key) => {
+                        use aes::cipher::BlockEncrypt;
+                        let mut padded = written_bytes.clone();
+                        padded.resize(align_usize(padded.len(), 16), 0);
+                        for aes_block in padded.chunks_mut(16) {
+                            key.0.encrypt_block(aes_block.into());
+                        }
+                        self.cas_stream.write_all(&padded)?;
+                        padded.len() as u64
+                    }
+                    None => {
+                        self.cas_stream.write_all(written_bytes)?;
+                        compressed_size as u64
+                    }
+                };
                 self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(offset, compressed_size, uncompressed_size, *actual_method_index));
-                offset += compressed_size as u64;
+                offset += stored_size;
             }
         }
         let flags = if any_block_compressed { FIoStoreTocEntryMetaFlags::Compressed } else { FIoStoreTocEntryMetaFlags::empty() };
@@ -206,6 +234,53 @@ mod test {
         let data = fs::read("tests/UE5.3/ScriptObjects.bin")?;
         writer.write_chunk_raw(FIoChunkIdRaw { id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5] }, Some(UEPath::new("../../../asdf/asdf/dasf/script_objects.bin")), &data)?;
         writer.finalize()?;
+        Ok(())
+    }
+
+    /// Uncompressed on purpose: it exercises the encrypt path without needing an Oodle library.
+    #[test]
+    fn encrypted_container_round_trips() -> Result<()> {
+        use crate::{Config, FGuid};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        const KEY: &str = "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
+        const BLOCK_SIZE: u32 = 0x10000;
+
+        let dir = std::env::temp_dir().join(format!("retoc-encrypted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let toc_path = dir.join("encrypted.utoc");
+
+        // Sized to leave a partial trailing block, so padding is not incidental.
+        let payload: Vec<u8> = (0..300_003u32).map(|i| (i % 251) as u8).collect();
+        let key: AesKey = KEY.parse()?;
+
+        let mut writer = IoStoreWriter::new(&toc_path, EIoStoreTocVersion::PerfectHashWithOverflow, None, "../../..".into(), None)?
+            .with_compression_block_size(BLOCK_SIZE)
+            .with_encryption(key.clone());
+        writer.write_chunk_raw(FIoChunkIdRaw { id: [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 5] }, Some(UEPath::new("../../../Marvel/Content/Test/Payload.bin")), &payload)?;
+        writer.finalize()?;
+
+        let raw = fs::read(&toc_path)?;
+        assert_eq!(raw[80] & 0b0010, 0b0010, "Encrypted container flag not set");
+        assert!(raw[64..80].iter().all(|&b| b == 0), "key GUID must stay all zero");
+
+        let config = Arc::new(Config { aes_keys: HashMap::from([(FGuid::default(), key)]), ..Default::default() });
+        let mut toc_stream = std::io::BufReader::new(fs::File::open(&toc_path)?);
+        let toc: Toc = toc_stream.de_ctx(config)?;
+
+        let expected_blocks = payload.len().div_ceil(BLOCK_SIZE as usize);
+        assert_eq!(toc.compression_blocks.len(), expected_blocks);
+        for pair in toc.compression_blocks.windows(2) {
+            let gap = pair[1].get_offset() - pair[0].get_offset();
+            assert_eq!(gap, align_usize(pair[0].get_compressed_size() as usize, 16) as u64);
+        }
+
+        let mut cas = std::io::BufReader::new(fs::File::open(toc_path.with_extension("ucas"))?);
+        assert_eq!(toc.read(&mut cas, 0)?, payload);
+
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }
