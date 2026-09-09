@@ -794,7 +794,9 @@ impl Display for FPackageId {
     }
 }
 impl FPackageId {
-    fn from_name(name: &str) -> Self {
+    /// The ID the loader derives for a package name, which is how a caller adding a localized
+    /// package or a redirect names its target.
+    pub fn from_name(name: &str) -> Self {
         Self(lower_utf16_cityhash(name))
     }
 }

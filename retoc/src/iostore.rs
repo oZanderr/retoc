@@ -14,6 +14,7 @@ use crate::{
     Config, EIoChunkType, EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoStoreTocEntryMetaFlags,
     FPackageId, Toc,
     chunk_id::FIoChunkIdRaw,
+    compression::CompressionMethod,
     container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry},
     file_pool::FilePool,
     script_objects::ZenScriptObjects,
@@ -108,6 +109,14 @@ pub trait IoStoreTrait: Send + Sync {
     fn chunk_path(&self, chunk_id: FIoChunkId) -> Option<String>;
     fn package_store_entry(&self, package_id: FPackageId) -> Option<StoreEntry>;
     fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId>;
+    /// The container's own header, for a caller rewriting a container around an edited package and
+    /// having to carry the tables the store entries do not cover: localized packages, redirects.
+    /// `None` for a container that has no header chunk or whose header did not parse.
+    fn container_header(&self) -> Option<&FIoContainerHeader>;
+    /// The compression methods the container's chunks are written with, in the order its blocks
+    /// index them. A caller rewriting a container reads this to keep the form it found rather than
+    /// re-compressing everything one way.
+    fn compression_methods(&self) -> &[CompressionMethod];
 
     fn load_script_objects(&self) -> Result<ZenScriptObjects> {
         let version = self.container_file_version()
@@ -319,6 +328,14 @@ impl IoStoreTrait for IoStoreBackend {
     fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId> {
         self.containers.iter().find_map(|c| c.lookup_package_redirect(source_package_id))
     }
+    fn container_header(&self) -> Option<&FIoContainerHeader> {
+        self.containers.iter().find_map(|c| c.container_header())
+    }
+    fn compression_methods(&self) -> &[CompressionMethod] {
+        // The containers are separate files with separate tables; the first that compresses
+        // anything is the only meaningful answer an aggregate can give.
+        self.containers.iter().map(|c| c.compression_methods()).find(|methods| !methods.is_empty()).unwrap_or(&[])
+    }
 }
 
 pub struct IoStoreContainer {
@@ -445,6 +462,12 @@ impl IoStoreTrait for IoStoreContainer {
     }
     fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId> {
         self.get_container_header().and_then(|header| header.lookup_package_redirect(source_package_id))
+    }
+    fn container_header(&self) -> Option<&FIoContainerHeader> {
+        self.get_container_header()
+    }
+    fn compression_methods(&self) -> &[CompressionMethod] {
+        &self.toc.compression_methods
     }
 }
 

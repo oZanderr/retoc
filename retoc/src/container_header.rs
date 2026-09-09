@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Seek;
 use std::{
@@ -265,6 +266,24 @@ impl FIoContainerHeader {
 
     pub fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId> {
         self.package_redirect_lookup.get(&source_package_id).cloned()
+    }
+
+    /// Source package names of the localized packages this container declares, in the order it
+    /// declares them. Pair with [`Self::add_localized_package`] to carry them into a container
+    /// being rewritten around an edited package.
+    ///
+    /// Empty for `Initial` and earlier, which track localized packages by ID per culture rather
+    /// than by name, and so cannot be replayed through the name-keyed setter.
+    pub fn localized_packages<'a>(&'a self) -> impl Iterator<Item = Cow<'a, str>> + 'a {
+        self.localized_packages.iter().map(|package| self.redirect_name_map.get(package.source_package_name))
+    }
+
+    /// Source package name and target package ID of every redirect this container declares, in the
+    /// order it declares them. Pair with [`Self::add_package_redirect`].
+    ///
+    /// Empty for `Initial` and earlier, for the same reason as [`Self::localized_packages`].
+    pub fn package_redirects<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, str>, FPackageId)> + 'a {
+        self.package_redirects.iter().map(|redirect| (self.redirect_name_map.get(redirect.source_package_name), redirect.target_package_id))
     }
 
     pub fn get_store_entry(&self, package_id: FPackageId) -> Option<StoreEntry> {
@@ -683,6 +702,44 @@ mod test {
         //fs::write("header_out.bin", out_cur.into_inner())?;
 
         assert_eq!(header, header2);
+        Ok(())
+    }
+
+    /// The accessors read back exactly what the setters put in, which is what lets a caller
+    /// rewriting a container carry these tables across. A container built without them reports
+    /// nothing rather than an empty-name entry.
+    #[test]
+    fn test_localized_and_redirect_accessors_round_trip() -> Result<()> {
+        let mut header = FIoContainerHeader::new(EIoContainerHeaderVersion::NoExportInfo, FIoContainerId(1));
+        assert_eq!(header.localized_packages().count(), 0);
+        assert_eq!(header.package_redirects().count(), 0);
+
+        header.add_localized_package("en", "/Game/Maps/Lobby", FPackageId::from_name("/Game/L10N/en/Maps/Lobby"))?;
+        // The same source twice is one entry: the runtime derives the localized IDs from the name.
+        header.add_localized_package("fr", "/Game/Maps/Lobby", FPackageId::from_name("/Game/L10N/fr/Maps/Lobby"))?;
+        header.add_localized_package("en", "/Game/Maps/Arena", FPackageId::from_name("/Game/L10N/en/Maps/Arena"))?;
+
+        let target = FPackageId::from_name("/Game/Maps/NewLobby");
+        header.add_package_redirect("/Game/Maps/OldLobby", target)?;
+
+        let localized: Vec<String> = header.localized_packages().map(|name| name.into_owned()).collect();
+        assert_eq!(localized, vec!["/Game/Maps/Lobby", "/Game/Maps/Arena"]);
+
+        let redirects: Vec<(String, FPackageId)> = header.package_redirects().map(|(name, id)| (name.into_owned(), id)).collect();
+        assert_eq!(redirects, vec![("/Game/Maps/OldLobby".to_string(), target)]);
+
+        // Replaying them into a fresh header leaves it declaring the same thing, which is the
+        // whole point of the accessors.
+        let mut carried = FIoContainerHeader::new(EIoContainerHeaderVersion::NoExportInfo, FIoContainerId(2));
+        for name in &localized {
+            carried.add_localized_package("", name, FPackageId::from_name(name))?;
+        }
+        for (name, id) in &redirects {
+            carried.add_package_redirect(name, *id)?;
+        }
+        let again: Vec<String> = carried.localized_packages().map(|name| name.into_owned()).collect();
+        assert_eq!(again, localized);
+        assert_eq!(carried.lookup_package_redirect(FPackageId::from_name("/Game/Maps/OldLobby")), Some(target));
         Ok(())
     }
 
