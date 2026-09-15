@@ -11,7 +11,7 @@ use oodle_loader::CompressionLevel;
 use rayon::prelude::*;
 use std::io::Cursor;
 use std::{
-    io::{BufWriter, Seek, Write},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
 
@@ -25,14 +25,18 @@ pub struct IoStoreWriter {
     compression_method: Option<CompressionMethod>,
     compression_level: Option<CompressionLevel>,
     encryption: Option<AesKey>,
+    /// How far into the cas stream the writer has got. Asking the `BufWriter` would flush it and
+    /// seek the file, which stops it coalescing anything across chunks.
+    cas_offset: u64,
 }
 
 impl IoStoreWriter {
     pub fn new<P: AsRef<Path>>(toc_path: P, toc_version: EIoStoreTocVersion, container_header_version: Option<EIoContainerHeaderVersion>, mount_point: UEPathBuf, compression_method: Option<CompressionMethod>) -> Result<Self> {
         let toc_path = toc_path.as_ref().to_path_buf();
         let name = toc_path.file_stem().unwrap().to_string_lossy();
-        let toc_stream = BufWriter::new(fs::File::create(&toc_path)?);
-        let cas_stream = BufWriter::new(fs::File::create(toc_path.with_extension("ucas"))?);
+        let toc_stream = BufWriter::with_capacity(1 << 20, fs::File::create(&toc_path)?);
+        let cas_stream =
+            BufWriter::with_capacity(4 << 20, fs::File::create(toc_path.with_extension("ucas"))?);
 
         let mut toc = Toc::new();
         toc.compression_block_size = 0x20000;
@@ -56,6 +60,7 @@ impl IoStoreWriter {
             compression_method,
             compression_level: None,
             encryption: None,
+            cas_offset: 0,
         })
     }
     /// Builder-style override for the Oodle compression level used by chunk writes.
@@ -95,7 +100,7 @@ impl IoStoreWriter {
             index.add_file(relative_path, self.toc.chunks.len() as u32);
         }
 
-        let mut offset = self.cas_stream.stream_position()?;
+        let mut offset = self.cas_offset;
 
         let start_block = self.toc.compression_blocks.len();
 
@@ -121,17 +126,22 @@ impl IoStoreWriter {
         let mut any_block_compressed = false;
         for slab in blocks.chunks(slab_blocks) {
             let compressed: Vec<(Vec<u8>, u8)> = if let Some(method) = active_compression {
-                slab.par_iter()
-                    .map(|block| -> Result<(Vec<u8>, u8)> {
-                        let mut buf = Vec::new();
-                        compression::compress(method, level, block, &mut buf)?;
-                        if buf.len() < block.len() {
-                            Ok((buf, compression_method_index))
-                        } else {
-                            Ok((block.to_vec(), 0))
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?
+                let compress_block = |block: &&[u8]| -> Result<(Vec<u8>, u8)> {
+                    let mut buf = Vec::new();
+                    compression::compress(method, level, block, &mut buf)?;
+                    if buf.len() < block.len() {
+                        Ok((buf, compression_method_index))
+                    } else {
+                        Ok((block.to_vec(), 0))
+                    }
+                };
+                // Handing one block to rayon parallelises nothing and costs the calling thread a
+                // park/unpark round trip, and most package chunks are a single block.
+                if slab.len() < 2 {
+                    slab.iter().map(compress_block).collect::<Result<Vec<_>>>()?
+                } else {
+                    slab.par_iter().map(compress_block).collect::<Result<Vec<_>>>()?
+                }
             } else {
                 slab.iter().map(|block| (block.to_vec(), 0)).collect()
             };
@@ -169,6 +179,8 @@ impl IoStoreWriter {
             chunk_hash: FIoChunkHash::from_blake3(hash.as_bytes()),
             flags,
         };
+
+        self.cas_offset = offset;
 
         let offset_and_length = FIoOffsetAndLength::new(start_block as u64 * self.toc.compression_block_size as u64, data.len() as u64);
 

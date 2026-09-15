@@ -39,7 +39,7 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use strum::{AsRefStr, FromRepr};
 use tracing::instrument;
@@ -330,11 +330,16 @@ fn read_chunk_block_signatures<R: Read>(stream: &mut R, header: &FIoStoreTocHead
     let is_signed = header.container_flags.contains(EIoContainerFlags::Signed);
     Ok(if is_signed {
         let size = stream.de::<u32>()? as usize;
-        Some(TocSignatures {
+        let signatures = TocSignatures {
             toc_signature: stream.de_ctx(size)?,
             block_signature: stream.de_ctx(size)?,
-            chunk_block_signatures: stream.de_ctx(header.toc_compressed_block_entry_count as usize)?,
-        })
+        };
+        // Consume the per-block hashes without keeping them; the stream has to end up past them
+        // either way, and the caller reads the chunk metas that follow.
+        let block_hash_bytes =
+            header.toc_compressed_block_entry_count as u64 * size_of::<FSHAHash>() as u64;
+        std::io::copy(&mut stream.take(block_hash_bytes), &mut std::io::sink())?;
+        Some(signatures)
     } else {
         None
     })
@@ -481,16 +486,20 @@ pub struct Toc {
 
     // transient indexes
     directory_index: FIoDirectoryIndexResource,
-    pub file_map: HashMap<String, u32>,
-    file_map_lower: HashMap<String, u32>,
+    /// Path to chunk index. Only tooling that unpacks by name needs it, and building it means a
+    /// second owned copy of every path in the container, so it is built on demand from the
+    /// directory index rather than at open.
+    file_map: OnceLock<HashMap<String, u32>>,
     file_map_rev: HashMap<u32, String>,
     chunk_id_map: HashMap<FIoChunkId, u32>,
 }
+/// The two container-level signatures. The per-block hashes that follow them are skipped rather
+/// than kept: nothing reads them, and a signed container carries one per compression block, which
+/// on a full game is tens of millions of bytes held for nothing.
 #[allow(unused)]
 pub struct TocSignatures {
     toc_signature: Vec<u8>,
     block_signature: Vec<u8>,
-    chunk_block_signatures: Vec<FSHAHash>,
 }
 impl Readable for Toc {
     fn de<S: Read>(stream: &mut S) -> Result<Self> {
@@ -512,19 +521,9 @@ impl ReadableCtx<Arc<Config>> for Toc {
         let chunk_metas = read_meta(stream, &header)?;
 
         // build indexes
-        let mut chunk_id_to_index: HashMap<FIoChunkId, u32> = Default::default();
-        for (chunk_index, &chunk_id) in chunk_ids.iter().enumerate() {
-            chunk_id_to_index.insert(chunk_id, chunk_index as u32);
-        }
-
-        let mut file_map: HashMap<String, u32> = Default::default();
-        let mut file_map_lower: HashMap<String, u32> = Default::default();
         let mut file_map_rev: HashMap<u32, String> = Default::default();
         directory_index.iter_root(|user_data, path| {
-            let path = path.join("/");
-            file_map_lower.insert(path.to_ascii_lowercase(), user_data);
-            file_map.insert(path.clone(), user_data);
-            file_map_rev.insert(user_data, path);
+            file_map_rev.insert(user_data, path.join("/"));
         });
         let chunk_id_map = chunk_ids.iter().enumerate().map(|(i, &chunk_id)| (chunk_id, i as u32)).collect();
 
@@ -549,8 +548,7 @@ impl ReadableCtx<Arc<Config>> for Toc {
             container_flags: header.container_flags,
 
             directory_index,
-            file_map,
-            file_map_lower,
+            file_map: OnceLock::new(),
             file_map_rev,
             chunk_id_map,
         })
@@ -650,9 +648,19 @@ impl Toc {
             .and_then(|index| self.file_map_rev.get(index))
             .map(|path| UEPath::new(&self.directory_index.mount_point).join(path).to_string())
     }
+    /// Path to chunk index, built on first use. See the field for why it is not built at open.
+    pub fn file_map(&self) -> &HashMap<String, u32> {
+        self.file_map.get_or_init(|| {
+            let mut built: HashMap<String, u32> = HashMap::with_capacity(self.file_map_rev.len());
+            for (index, path) in &self.file_map_rev {
+                built.insert(path.clone(), *index);
+            }
+            built
+        })
+    }
     #[allow(unused)]
     pub fn get_chunk_info(&self, file_name: &str) -> FIoStoreTocChunkInfo {
-        let toc_entry_index = self.file_map[file_name] as usize;
+        let toc_entry_index = self.file_map()[file_name] as usize;
         let meta = &self.chunk_metas[toc_entry_index];
         let offset_and_length = &self.chunk_offset_lengths[toc_entry_index];
 

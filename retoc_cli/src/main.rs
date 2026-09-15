@@ -515,13 +515,13 @@ fn action_unpack(args: ActionUnpack, config: Arc<Config>) -> Result<()> {
 
     // TODO extract entries not found in directory index
     // TODO output chunk id manifest
-    toc.file_map.keys().par_bridge().try_for_each_init(
+    toc.file_map().keys().par_bridge().try_for_each_init(
         || BufReader::new(fs::File::open(ucas).unwrap()),
         |ucas, file_name| -> Result<()> {
             if args.verbose {
                 println!("{file_name}");
             }
-            let data = toc.read(ucas, toc.file_map[file_name])?;
+            let data = toc.read(ucas, toc.file_map()[file_name])?;
 
             let path = output.join(file_name);
             let dir = path.parent().unwrap();
@@ -531,7 +531,7 @@ fn action_unpack(args: ActionUnpack, config: Arc<Config>) -> Result<()> {
         },
     )?;
 
-    println!("unpacked {} files to {}", toc.file_map.len(), output.to_string_lossy());
+    println!("unpacked {} files to {}", toc.file_map().len(), output.to_string_lossy());
 
     Ok(())
 }

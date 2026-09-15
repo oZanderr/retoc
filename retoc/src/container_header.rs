@@ -140,7 +140,7 @@ impl FIoContainerHeader {
 
         if self.version <= EIoContainerHeaderVersion::Initial {
             // Serialize container local name map. This map is generally empty in legacy UE4 containers because there are no fields that write to it
-            let (names_buffer, name_hashes_buffer) = write_name_batch_parts(&self.redirect_name_map.copy_raw_names())?;
+            let (names_buffer, name_hashes_buffer) = write_name_batch_parts(self.redirect_name_map.raw_names())?;
             s.ser(&names_buffer)?;
             s.ser(&name_hashes_buffer)?;
         }

@@ -1131,7 +1131,7 @@ impl FZenPackageHeader {
             self.name_map.serialize(s)?;
         } else {
             // Serialize name map parts separately for legacy packages
-            let (names_buffer, hashes_buffer) = write_name_batch_parts(&self.name_map.copy_raw_names())?;
+            let (names_buffer, hashes_buffer) = write_name_batch_parts(self.name_map.raw_names())?;
 
             // Serialize name map names
             package_summary.name_map_names_offset = (s.stream_position()? - package_summary_offset) as i32;

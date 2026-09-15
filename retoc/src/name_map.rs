@@ -189,6 +189,10 @@ impl FNameMap {
         FMappedName::create(new_name_index as u32, self.kind, name_number as u32)
     }
 
+    /// The names as they are, for callers that only need to read or slice them.
+    pub fn raw_names(&self) -> &[String] {
+        &self.names
+    }
     pub fn copy_raw_names(&self) -> Vec<String> {
         self.names.clone()
     }

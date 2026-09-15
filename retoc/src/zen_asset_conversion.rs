@@ -126,7 +126,7 @@ fn setup_zen_package_summary(builder: &mut ZenPackageBuilder, _ubulk_size: Optio
     // Copy name map from the cooked package up to the number of names referenced by exports
     // We do not actually need the rest of the name map
     let name_map_size = builder.legacy_package.summary.names_referenced_from_export_data_count as usize;
-    let name_map_slice = builder.legacy_package.name_map.copy_raw_names()[0..name_map_size].to_vec();
+    let name_map_slice = builder.legacy_package.name_map.raw_names()[0..name_map_size].to_vec();
     builder.zen_package.name_map = FNameMap::create_from_names(EMappedNameType::Package, name_map_slice);
 
     // Make sure not to attempt to put uncooked packages into zen
@@ -1123,7 +1123,11 @@ fn write_exports_in_bundle_order<S: Write>(writer: &mut S, builder: &ZenPackageB
 }
 
 fn serialize_zen_asset(builder: &ZenPackageBuilder, legacy_asset_bundle: &FSerializedAssetBundle) -> anyhow::Result<(StoreEntry, Vec<u8>, Vec<u64>)> {
-    let mut result_package_buffer: Vec<u8> = Vec::new();
+    // The zen header replaces a legacy header of similar size and the exports are copied verbatim,
+    // so the legacy bundle's own size is a tight starting point.
+    let mut result_package_buffer: Vec<u8> = Vec::with_capacity(
+        legacy_asset_bundle.asset_file_buffer.len() + legacy_asset_bundle.exports_file_buffer.len(),
+    );
     let mut result_package_writer = Cursor::new(&mut result_package_buffer);
     let mut result_store_entry: StoreEntry = StoreEntry::default();
 

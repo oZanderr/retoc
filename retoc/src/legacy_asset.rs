@@ -649,6 +649,10 @@ impl FPackageNameMap {
     pub fn copy_raw_names(&self) -> Vec<String> {
         self.names.clone()
     }
+    /// The names as they are, for callers that only need to read or slice them.
+    pub fn raw_names(&self) -> &[String] {
+        &self.names
+    }
 }
 
 #[derive(Debug, Clone, Default)]
