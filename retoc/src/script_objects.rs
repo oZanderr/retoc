@@ -36,6 +36,54 @@ impl ZenScriptObjects {
         s.ser(&self.script_objects)?;
         Ok(())
     }
+    /// An empty table with a global name map, for building one from paths alone.
+    pub fn create_empty() -> Self {
+        Self::new(Vec::new(), FNameMap::create(EMappedNameType::Global))
+    }
+    /// Adds an entry for every object path the table lacks, following the gen-script-objects
+    /// convention: `/Script/Pkg` keeps its full path as the name with a null outer; anything deeper
+    /// keeps its leaf name under its outer. Missing outers are added too, and a `Default__X`
+    /// directly under a package is given `Pkg.X` as its CDO class so that class is labelled as one.
+    /// Returns how many entries were added.
+    pub fn extend_with_paths<'p>(&mut self, paths: impl IntoIterator<Item = &'p str>) -> usize {
+        let before = self.script_objects.len();
+        for path in paths {
+            self.add_path(path);
+        }
+        self.script_objects.len() - before
+    }
+    fn add_path(&mut self, path: &str) -> bool {
+        let global_index = FPackageObjectIndex::create_script_import(path);
+        if self.script_object_lookup.contains_key(&global_index) {
+            return false;
+        }
+        let (name, outer_index, cdo_class_index) = match path.rfind(['.', ':']) {
+            None => (path, FPackageObjectIndex::create_null(), FPackageObjectIndex::create_null()),
+            Some(split) => {
+                let (outer, name) = (&path[..split], &path[split + 1..]);
+                self.add_path(outer);
+                let outer_is_package = !outer.contains(['.', ':']);
+                let cdo_class_index = match name.strip_prefix("Default__") {
+                    Some(class) if outer_is_package => {
+                        let class_path = format!("{outer}.{class}");
+                        self.add_path(&class_path);
+                        FPackageObjectIndex::create_script_import(&class_path)
+                    }
+                    _ => FPackageObjectIndex::create_null(),
+                };
+                (name, FPackageObjectIndex::create_script_import(outer), cdo_class_index)
+            }
+        };
+        let entry = FScriptObjectEntry {
+            object_name: self.global_name_map.store(name),
+            global_index,
+            outer_index,
+            cdo_class_index,
+        };
+        self.script_objects.push(entry);
+        self.script_object_lookup.insert(global_index, entry);
+        true
+    }
     fn new(script_objects: Vec<FScriptObjectEntry>, global_name_map: FNameMap) -> Self {
         // Build lookup by package object index for fast access
         let mut script_object_lookup: HashMap<FPackageObjectIndex, FScriptObjectEntry> = HashMap::with_capacity(script_objects.len());
@@ -218,6 +266,46 @@ mod test {
     use std::io::BufReader;
 
     use super::*;
+
+    #[test]
+    fn extending_with_paths_synthesises_outers_and_known_hashes() {
+        let mut table = ZenScriptObjects::create_empty();
+        let added = table.extend_with_paths(["/Script/NePatchUtility.NePatchUtility:MountPak", "/Script/NePatchUtility.Default__NePatchUtility"]);
+        assert_eq!(added, 4);
+
+        let package = FPackageObjectIndex::create_from_raw(0x6b97a5a0579ae351);
+        let class = FPackageObjectIndex::create_from_raw(0x71515cdfe40c0987);
+        let mount_pak = FPackageObjectIndex::create_from_raw(0x46a3791039776701);
+        let package_entry = table.script_object_lookup[&package];
+        assert!(package_entry.outer_index.is_null());
+        assert_eq!(table.global_name_map.get(package_entry.object_name), "/Script/NePatchUtility");
+        let class_entry = table.script_object_lookup[&class];
+        assert_eq!(class_entry.outer_index, package);
+        assert_eq!(table.global_name_map.get(class_entry.object_name), "NePatchUtility");
+        assert!(class_entry.cdo_class_index.is_null());
+        let function_entry = table.script_object_lookup[&mount_pak];
+        assert_eq!(function_entry.outer_index, class);
+        assert_eq!(table.global_name_map.get(function_entry.object_name), "MountPak");
+        let cdo_entry = table.script_object_lookup[&FPackageObjectIndex::create_script_import("/Script/NePatchUtility.Default__NePatchUtility")];
+        assert_eq!(cdo_entry.outer_index, package);
+        assert_eq!(cdo_entry.cdo_class_index, class);
+
+        assert_eq!(table.extend_with_paths(["/Script/NePatchUtility", "/Script/NePatchUtility.NePatchUtility:MountPak"]), 0);
+        assert_eq!(table.script_objects.len(), 4);
+    }
+
+    #[test]
+    fn known_native_paths_hash_to_the_verified_indices() {
+        for (path, raw) in [
+            ("/Script/NePatchUtility.NePatchUtility:UnmountPak", 0x4916536cbd4ab90bu64),
+            ("/Script/NePatchUtility.NePatchUtility:GetMountedPakNames", 0x73341021be7e0692),
+            ("/Script/NePatchUtility.NePatchUtility:GetHashFilePaths", 0x5885104175ce022b),
+            ("/Script/NePatchUtility.NePatchUtility:GetUtocEntryInfos", 0x73c7dddf3f70cac5),
+        ] {
+            assert_eq!(FPackageObjectIndex::create_script_import(path).to_raw(), raw, "{path}");
+        }
+    }
+
     #[test]
     fn test_read_script_objects_new() -> Result<()> {
         let mut stream = BufReader::new(fs::File::open("tests/UE5.3/ScriptObjects.bin")?);

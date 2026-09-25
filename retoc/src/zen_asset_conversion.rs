@@ -11,6 +11,7 @@ use crate::zen::{
     FPackageFileVersion, FPackageIndex, FZenPackageHeader, FZenPackageVersioningInfo, ZenScriptCellsStore,
 };
 use crate::{EIoChunkType, FIoChunkId, FPackageId, FSHAHash, UEPath, UEPathBuf};
+use crate::asset_conversion::{decode_unresolved_script_import_name, UNKNOWN_PACKAGE_NAME};
 use crate::{debug, warning};
 use anyhow::{Context, anyhow, bail};
 use byteorder::{LE, ReadBytesExt};
@@ -225,9 +226,13 @@ fn resolve_legacy_package_object(package: &ZenPackageBuilder, object_index: FPac
 fn convert_legacy_import_to_object_index(builder: &mut ZenPackageBuilder, import_index: usize) -> anyhow::Result<FPackageObjectIndex> {
     let (package_name, full_import_name) = resolve_legacy_package_object(builder, FPackageIndex::create_import(import_index as u32))?;
 
-    // Restore an import that extraction could not resolve and preserved by encoding the raw export
-    // hash in the object name (see asset_conversion::try_preserve_unresolved_package_import).
+    // Restore an import that extraction could not resolve and preserved by encoding the raw index
+    // in the object name: a script import whole (see asset_conversion::preserve_unresolved_script_import),
+    // a package import by its export hash (see asset_conversion::try_preserve_unresolved_package_import).
     let object_path = full_import_name.get(package_name.len() + 1..).unwrap_or("");
+    if let Some(index) = decode_unresolved_script_import_name(object_path) {
+        return Ok(index);
+    }
     if builder.container_header_version > EIoContainerHeaderVersion::Initial
         && let Some(hex) = object_path.strip_prefix(crate::asset_conversion::UNRESOLVED_EXPORT_HASH_PREFIX)
         && let Ok(export_hash) = u64::from_str_radix(hex, 16)
@@ -239,8 +244,17 @@ fn convert_legacy_import_to_object_index(builder: &mut ZenPackageBuilder, import
 
     // /Engine/UnknownPackage is the extraction sentinel for an unresolvable import; emitting it as
     // a real PackageImport fatal-asserts in UE's loader, so map it to Null (the loader's standard
-    // "missing reference" signal) instead.
-    if package_name.eq_ignore_ascii_case("/Engine/UnknownPackage") {
+    // "missing reference" signal) instead. The package-only import is the outer every preserved
+    // hash hangs off, so only an object under it means a reference was lost.
+    if package_name.eq_ignore_ascii_case(UNKNOWN_PACKAGE_NAME) {
+        if !object_path.is_empty() {
+            warning!(
+                builder.log,
+                "Package {} import {} was not resolved when it was extracted; writing a null import",
+                &builder.package_name,
+                &full_import_name
+            );
+        }
         return Ok(FPackageObjectIndex::create_null());
     }
 
@@ -1191,6 +1205,10 @@ impl ConvertedZenAssetBundle {
     pub fn package_data_size(&self) -> usize {
         self.package_buffer.len()
     }
+    /// The package chunk as it will be written, header and exports together.
+    pub fn package_data(&self) -> &[u8] {
+        &self.package_buffer
+    }
     /// Container-header store entry this package contributes.
     pub fn store_entry(&self) -> &StoreEntry {
         &self.store_entry
@@ -1399,6 +1417,7 @@ pub fn build_zen_asset(
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::legacy_asset::{CORE_OBJECT_PACKAGE_NAME, FObjectImport, OBJECT_CLASS_NAME, PACKAGE_CLASS_NAME};
     use crate::version::EngineVersion;
     use crate::{EIoStoreTocVersion, PackageTestMetadata};
     use fs_err as fs;
@@ -1411,6 +1430,30 @@ mod test {
 
         let (store_entry, package_data, _) = serialize_zen_asset(&builder, legacy_asset)?;
         Ok((builder.package_id, store_entry, package_data))
+    }
+
+    /// A preserved script hash decodes to its raw index ahead of the sentinel and `/Script/`
+    /// branches; the sentinel package and an old-style `UnknownExport` under it both go to null.
+    #[test]
+    fn a_preserved_script_import_rebuilds_to_the_raw_index() -> anyhow::Result<()> {
+        let mut package = FLegacyPackageHeader::default();
+        package.summary.package_name = "/Game/Test".to_string();
+        let core = package.name_map.store(CORE_OBJECT_PACKAGE_NAME);
+        let package_class = package.name_map.store(PACKAGE_CLASS_NAME);
+        let object_class = package.name_map.store(OBJECT_CLASS_NAME);
+        let unknown_package = package.name_map.store(crate::asset_conversion::UNKNOWN_PACKAGE_NAME);
+        let script_hash = package.name_map.store("__zenrawscripthash_46a3791039776701");
+        let unknown_export = package.name_map.store("UnknownExport");
+        package.imports.push(FObjectImport { class_package: core, class_name: package_class, outer_index: FPackageIndex::create_null(), object_name: unknown_package, is_optional: false });
+        package.imports.push(FObjectImport { class_package: core, class_name: object_class, outer_index: FPackageIndex::create_import(0), object_name: script_hash, is_optional: false });
+        package.imports.push(FObjectImport { class_package: core, class_name: object_class, outer_index: FPackageIndex::create_import(0), object_name: unknown_export, is_optional: false });
+
+        let logger = Log::no_log();
+        let mut builder = create_asset_builder(package, EngineVersion::UE5_3.container_header_version(), false, None, None, None, &logger);
+        assert_eq!(convert_legacy_import_to_object_index(&mut builder, 1)?, FPackageObjectIndex::create_from_raw(0x46a3791039776701));
+        assert_eq!(convert_legacy_import_to_object_index(&mut builder, 0)?, FPackageObjectIndex::create_null());
+        assert_eq!(convert_legacy_import_to_object_index(&mut builder, 2)?, FPackageObjectIndex::create_null());
+        Ok(())
     }
 
     #[test]

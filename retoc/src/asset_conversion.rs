@@ -32,6 +32,8 @@ pub struct FZenPackageContext<'a> {
     /// this is a `OnceLock` rather than an `RwLock`: every read would otherwise be an atomic
     /// read-modify-write on one cache line shared by every worker thread.
     script_objects: Arc<OnceLock<FZenPackageContextScriptObjects>>,
+    /// Object paths merged into the table the store loads, for native objects it leaves out.
+    extra_script_objects: Vec<String>,
     package_lookup_locks: KeyMutex<FPackageId, ()>,
     package_cell_verse_path_lookup_locks: KeyMutex<FPackageId, ()>,
 }
@@ -55,16 +57,28 @@ impl<'a> FZenPackageContext<'a> {
             log,
             script_cells,
             script_objects: Default::default(),
+            extra_script_objects: Vec::new(),
             inner_state: Default::default(),
             package_lookup_locks: KeyMutex::new(),
             package_cell_verse_path_lookup_locks: KeyMutex::new(),
         }
     }
+    /// Names script imports the store's table lacks, given as object paths such as
+    /// `/Script/Pkg.Class:Function`. Takes `self` so the extras are in place before the table
+    /// is first built.
+    pub fn with_extra_script_objects(mut self, paths: Vec<String>) -> Self {
+        self.extra_script_objects = paths;
+        self
+    }
     fn get_script_objects(&self) -> anyhow::Result<&FZenPackageContextScriptObjects> {
         if let Some(loaded) = self.script_objects.get() {
             return Ok(loaded);
         }
-        let script_objects = self.store_access.load_script_objects()?;
+        let mut script_objects = self.store_access.load_script_objects()?;
+        if !self.extra_script_objects.is_empty() {
+            let added = script_objects.extend_with_paths(self.extra_script_objects.iter().map(String::as_str));
+            verbose!(self.log, "Added {} script objects from the supplied list", added);
+        }
         let mut script_objects_resolved_as_classes = HashSet::new();
 
         // Do a quick check over all script objects to track which ones are being pointed to by the CDOs. These are 100% UClasses
@@ -708,21 +722,23 @@ fn build_import_map(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
                     loading_error_message
                 );
             }
-            builder.has_failed_import_map_entries = true;
-
-            // Preserve the real reference if we still have the package name + export hash;
-            // /Engine/UnknownPackage is the fallback and UE's loader fatal-asserts on that name.
-            let import_map_index = if let Some(index) =
-                try_preserve_unresolved_package_import(builder, import_object_index)
-            {
-                index
+            // Preserve the real reference where it survives: a script import is its raw index,
+            // a package import keeps its package name + export hash. /Engine/UnknownPackage is
+            // the fallback and UE's loader fatal-asserts on that name.
+            let import_map_index = if import_object_index.kind() == FPackageObjectIndexType::ScriptImport {
+                preserve_unresolved_script_import(builder, import_object_index)
             } else {
-                let null_package_import = create_and_add_unknown_package_import(builder);
-                let index = FPackageIndex::create_import(builder.legacy_package.imports.len() as u32);
-                let null_object_import =
-                    create_unknown_object_import_map_entry(builder, null_package_import);
-                builder.legacy_package.imports.push(null_object_import);
-                index
+                builder.has_failed_import_map_entries = true;
+                if let Some(index) = try_preserve_unresolved_package_import(builder, import_object_index) {
+                    index
+                } else {
+                    let null_package_import = create_and_add_unknown_package_import(builder);
+                    let index = FPackageIndex::create_import(builder.legacy_package.imports.len() as u32);
+                    let null_object_import =
+                        create_unknown_object_import_map_entry(builder, null_package_import);
+                    builder.legacy_package.imports.push(null_object_import);
+                    index
+                }
             };
             builder.zen_import_lookup.insert(import_object_index, import_map_index);
             import_map_index
@@ -1265,11 +1281,15 @@ fn resolve_prestream_package_imports(builder: &mut LegacyAssetBuilder) -> anyhow
     Ok(())
 }
 
+/// Package name the legacy form uses for an import extraction could not resolve. Never emitted as
+/// a real package import on rebuild: UE's loader fatal-asserts on it.
+pub const UNKNOWN_PACKAGE_NAME: &str = "/Engine/UnknownPackage";
+
 fn create_unknown_package_import_map_entry(builder: &mut LegacyAssetBuilder) -> FObjectImport {
     let class_package = builder.legacy_package.name_map.store(CORE_OBJECT_PACKAGE_NAME);
     let class_name = builder.legacy_package.name_map.store(PACKAGE_CLASS_NAME);
     // The package name here can be anything except for a script import
-    let object_name = builder.legacy_package.name_map.store("/Engine/UnknownPackage");
+    let object_name = builder.legacy_package.name_map.store(UNKNOWN_PACKAGE_NAME);
 
     FObjectImport {
         class_package,
@@ -1289,7 +1309,42 @@ fn create_and_add_unknown_package_import(builder: &mut LegacyAssetBuilder) -> FP
 /// Object-import name prefix carrying a raw zen public-export hash through the legacy form so the
 /// legacy->zen rebuild can reconstruct an unresolved import without emitting /Engine/UnknownPackage
 /// (UE's loader fatal-asserts on that name).
-pub(crate) const UNRESOLVED_EXPORT_HASH_PREFIX: &str = "__zenrawexporthash_";
+pub const UNRESOLVED_EXPORT_HASH_PREFIX: &str = "__zenrawexporthash_";
+
+/// Object-import name prefix carrying a raw ScriptImport index (type bits included) through the
+/// legacy form, for a native object the script objects table does not list.
+pub const UNRESOLVED_SCRIPT_HASH_PREFIX: &str = "__zenrawscripthash_";
+
+pub fn encode_unresolved_script_import_name(index: FPackageObjectIndex) -> String {
+    format!("{UNRESOLVED_SCRIPT_HASH_PREFIX}{:016x}", index.to_raw())
+}
+
+/// The ScriptImport index an object name made by [`encode_unresolved_script_import_name`] carries.
+/// Hex case does not matter, since the legacy full name is lowercased on the way back.
+pub fn decode_unresolved_script_import_name(object_path: &str) -> Option<FPackageObjectIndex> {
+    let hex = object_path.strip_prefix(UNRESOLVED_SCRIPT_HASH_PREFIX)?;
+    let raw = u64::from_str_radix(hex, 16).ok()?;
+    let index = FPackageObjectIndex::create_from_raw(raw);
+    (index.kind() == FPackageObjectIndexType::ScriptImport).then_some(index)
+}
+
+/// A ScriptImport the table cannot name still round-trips exactly: its raw index is the whole
+/// reference, so carry it in the object name and let the rebuild decode it.
+fn preserve_unresolved_script_import(builder: &mut LegacyAssetBuilder, import: FPackageObjectIndex) -> FPackageIndex {
+    let package = ResolvedZenImport {
+        class_package: CORE_OBJECT_PACKAGE_NAME.to_string(),
+        class_name: PACKAGE_CLASS_NAME.to_string(),
+        object_name: UNKNOWN_PACKAGE_NAME.to_string(),
+        outer: None,
+    };
+    let object = ResolvedZenImport {
+        class_package: CORE_OBJECT_PACKAGE_NAME.to_string(),
+        class_name: OBJECT_CLASS_NAME.to_string(),
+        object_name: encode_unresolved_script_import_name(import),
+        outer: Some(Box::new(package)),
+    };
+    find_or_add_resolved_import(builder, &object)
+}
 
 /// Emit a real package import + an object import whose name encodes the raw export hash, so the
 /// rebuild can decode it back to the exact reference. Returns None when the import lacks a usable
@@ -1593,4 +1648,26 @@ pub fn build_legacy(package_context: &FZenPackageContext, package_id: FPackageId
     // Write the asset to the file
     write_asset(&mut asset_builder, out_path, file_writer)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn encode_decode_script_hash_round_trips() {
+        let mount_pak = FPackageObjectIndex::create_script_import("/Script/NePatchUtility.NePatchUtility:MountPak");
+        let name = encode_unresolved_script_import_name(mount_pak);
+        assert_eq!(name, "__zenrawscripthash_46a3791039776701");
+        assert_eq!(decode_unresolved_script_import_name(&name), Some(mount_pak));
+        assert_eq!(decode_unresolved_script_import_name(&name.to_uppercase().replace("__ZENRAWSCRIPTHASH_", "__zenrawscripthash_")), Some(mount_pak));
+        assert_eq!(decode_unresolved_script_import_name(&name), Some(FPackageObjectIndex::create_from_raw(0x46a3791039776701)));
+
+        assert_eq!(decode_unresolved_script_import_name("__zenrawscripthash_zz"), None);
+        // A PackageImport-tagged value is not a script import, whatever the name claims.
+        let package_import = FPackageObjectIndex::create_from_raw(0x8000000000000001);
+        assert_eq!(decode_unresolved_script_import_name(&encode_unresolved_script_import_name(package_import)), None);
+        assert_eq!(decode_unresolved_script_import_name("__zenrawexporthash_46a3791039776701"), None);
+        assert_eq!(decode_unresolved_script_import_name("MountPak"), None);
+    }
 }
