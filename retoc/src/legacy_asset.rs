@@ -498,6 +498,11 @@ impl FLegacyPackageFileSummary {
             s.ser(&self.package_guid)?;
         }
 
+        // Persistent package GUID is never written for cooked packages. It comes before the generations, as the reader expects
+        if !self.is_filter_editor_only() {
+            let persistent_package_guid = FGuid { a: 0, b: 0, c: 0, d: 0 };
+            s.ser(&persistent_package_guid)?;
+        }
         // Package generations are always saved as one entry for modern packages, but not used in runtime
         // Note that the FLinkerLoad expects there to still be a single generation, it will crash if there is none
         let package_generations: Vec<FGenerationInfo> = vec![FGenerationInfo {
@@ -505,11 +510,6 @@ impl FLegacyPackageFileSummary {
             name_count: self.names.count,
         }];
         s.ser(&package_generations)?;
-        // Persistent package GUID is never written for cooked packages
-        if !self.is_filter_editor_only() {
-            let persistent_package_guid = FGuid { a: 0, b: 0, c: 0, d: 0 };
-            s.ser(&persistent_package_guid)?;
-        }
 
         // Saved and compatible engine versions are always empty for cooked packages
         let saved_by_engine_version = FEngineVersion {
@@ -1353,3 +1353,39 @@ pub const OBJECT_CLASS_NAME: &str = "Object";
 pub const CLASS_CLASS_NAME: &str = "Class";
 pub const PACKAGE_CLASS_NAME: &str = "Package";
 pub const PRESTREAM_PACKAGE_CLASS_NAME: &str = "PrestreamPackage";
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::version::EngineVersion;
+    use std::io::Cursor;
+
+    // The fields after the generations only read back when both sides agree on where the persistent GUID goes
+    #[test]
+    fn summary_round_trips_with_and_without_editor_only_data() {
+        for package_flags in [EPackageFlags::Cooked as u32, EPackageFlags::Cooked as u32 | EPackageFlags::FilterEditorOnly as u32] {
+            let mut summary = FLegacyPackageFileSummary {
+                package_name: "/Game/Test".to_string(),
+                package_flags,
+                ..Default::default()
+            };
+            summary.versioning_info.package_file_version = EngineVersion::UE5_3.package_file_version();
+            summary.names = FCountOffsetPair { count: 49, offset: 254 };
+            summary.asset_registry_data_offset = 1148;
+            summary.bulk_data_start_offset = 1391;
+            summary.names_referenced_from_export_data_count = 49;
+            summary.data_resource_offset = -1;
+
+            let mut written = Cursor::new(Vec::new());
+            summary.serialize(&mut written).unwrap();
+            let mut reader = Cursor::new(written.get_ref().as_slice());
+            let read = FLegacyPackageFileSummary::deserialize(&mut reader, None).unwrap();
+
+            assert_eq!(reader.position() as usize, written.get_ref().len(), "flags {package_flags:#X}");
+            assert_eq!(read.asset_registry_data_offset, 1148, "flags {package_flags:#X}");
+            assert_eq!(read.bulk_data_start_offset, 1391, "flags {package_flags:#X}");
+            assert_eq!(read.names_referenced_from_export_data_count, 49, "flags {package_flags:#X}");
+            assert_eq!(read.data_resource_offset, -1, "flags {package_flags:#X}");
+        }
+    }
+}
