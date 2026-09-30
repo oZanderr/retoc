@@ -68,6 +68,12 @@ pub fn open_filtered<P: AsRef<Path>>(path: P, config: Arc<Config>, filter: impl 
     Ok(if path.as_ref().is_dir() { Box::new(IoStoreBackend::open_filtered(path, config, filter)?) } else { Box::new(IoStoreContainer::open(path, config)?) })
 }
 
+/// Open a directory of IoStore containers filtered by stem, as [`open_filtered`] does, together
+/// with `extra` .utoc files from anywhere, which take their place among them by the same priority.
+pub fn open_filtered_with<P: AsRef<Path>>(dir: P, config: Arc<Config>, filter: impl Fn(&str) -> bool, extra: &[PathBuf]) -> Result<Box<dyn IoStoreTrait>> {
+    Ok(Box::new(IoStoreBackend::open_filtered_with(dir, config, filter, extra)?))
+}
+
 /// Return an object that can be sorted by to achieve container priority.
 /// Higher priority should Cmp higher
 fn sort_container_name(full_name: &str) -> (bool, u32, &str) {
@@ -217,6 +223,9 @@ impl IoStoreBackend {
         Self::open_filtered(dir, config, |_| true)
     }
     pub fn open_filtered<P: AsRef<Path>>(dir: P, config: Arc<Config>, filter: impl Fn(&str) -> bool) -> Result<Self> {
+        Self::open_filtered_with(dir, config, filter, &[])
+    }
+    pub fn open_filtered_with<P: AsRef<Path>>(dir: P, config: Arc<Config>, filter: impl Fn(&str) -> bool, extra: &[PathBuf]) -> Result<Self> {
         fn collect_utocs(dir: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
@@ -232,6 +241,7 @@ impl IoStoreBackend {
         let mut utoc_paths = Vec::new();
         collect_utocs(dir.as_ref(), &mut utoc_paths)?;
         utoc_paths.retain(|p| p.file_stem().and_then(|s| s.to_str()).is_some_and(&filter));
+        utoc_paths.extend(extra.iter().cloned());
         let mut containers: Vec<Box<dyn IoStoreTrait>> = utoc_paths.into_par_iter().map(|path| -> Result<Box<dyn IoStoreTrait>> { Ok(Box::new(IoStoreContainer::open(path, config.clone())?)) }).collect::<Result<Vec<_>>>()?;
         // Validate that all containers are of the same TOC version
         let mut previous_container_version: Option<EIoStoreTocVersion> = None;
@@ -474,6 +484,20 @@ impl IoStoreTrait for IoStoreContainer {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// A container named alongside a directory is opened with it, and one that is not there is an
+    /// error rather than a store that silently lacks it.
+    #[test]
+    fn test_open_filtered_with_extra() {
+        let dir = std::env::temp_dir().join(format!("retoc-open-with-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Arc::new(Config::default());
+        let empty = open_filtered_with(&dir, config.clone(), |_| true, &[]).unwrap();
+        assert_eq!(empty.child_containers().count(), 0);
+        let missing = dir.join("elsewhere").join("Missing_P.utoc");
+        assert!(open_filtered_with(&dir, config, |_| true, &[missing]).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_sort_container() {
