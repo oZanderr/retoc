@@ -226,23 +226,41 @@ impl IoStoreBackend {
         Self::open_filtered_with(dir, config, filter, &[])
     }
     pub fn open_filtered_with<P: AsRef<Path>>(dir: P, config: Arc<Config>, filter: impl Fn(&str) -> bool, extra: &[PathBuf]) -> Result<Self> {
+        // A folder or container under `dir` can go between being listed and being read, such as a
+        // writer's staging folder, and is left out rather than failing the open. `dir` itself and
+        // the `extra` containers asked for by path still have to read.
         fn collect_utocs(dir: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
             for entry in std::fs::read_dir(dir)? {
-                let entry = entry?;
+                let Ok(entry) = entry else { continue };
                 let path = entry.path();
                 if path.is_dir() {
-                    collect_utocs(&path, paths)?;
+                    match collect_utocs(&path, paths) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        other => other?,
+                    }
                 } else if path.extension() == Some(OsStr::new("utoc")) {
                     paths.push(path);
                 }
             }
             Ok(())
         }
+        fn gone(error: &anyhow::Error) -> bool {
+            error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound))
+        }
         let mut utoc_paths = Vec::new();
         collect_utocs(dir.as_ref(), &mut utoc_paths)?;
         utoc_paths.retain(|p| p.file_stem().and_then(|s| s.to_str()).is_some_and(&filter));
+        let walked = utoc_paths.len();
         utoc_paths.extend(extra.iter().cloned());
-        let mut containers: Vec<Box<dyn IoStoreTrait>> = utoc_paths.into_par_iter().map(|path| -> Result<Box<dyn IoStoreTrait>> { Ok(Box::new(IoStoreContainer::open(path, config.clone())?)) }).collect::<Result<Vec<_>>>()?;
+        let mut containers: Vec<Box<dyn IoStoreTrait>> = utoc_paths
+            .into_par_iter()
+            .enumerate()
+            .filter_map(|(at, path)| match IoStoreContainer::open(path, config.clone()) {
+                Ok(container) => Some(Ok(Box::new(container) as Box<dyn IoStoreTrait>)),
+                Err(e) if at < walked && gone(&e) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<Vec<_>>>()?;
         // Validate that all containers are of the same TOC version
         let mut previous_container_version: Option<EIoStoreTocVersion> = None;
         let mut previous_container_name: String = String::new();
