@@ -164,11 +164,14 @@ impl ChunkInfo<'_> {
         &self.container.toc.chunk_metas[self.toc_index() as usize].chunk_hash
     }
     /// Whether this chunk is stored compressed on disk (vs. raw). Lets callers reproduce a
-    /// source container's per-chunk compression decision when rebuilding.
+    /// source container's per-chunk compression decision when rebuilding. Its blocks decide, as
+    /// they do for a reader: some packers compress them without setting the chunk's meta flag.
     pub fn is_compressed(&self) -> bool {
-        self.container.toc.chunk_metas[self.toc_index() as usize]
+        let index = self.toc_index();
+        self.container.toc.chunk_metas[index as usize]
             .flags
             .contains(FIoStoreTocEntryMetaFlags::Compressed)
+            || self.container.toc.any_block_compressed(index)
     }
     pub fn read(&self) -> Result<Vec<u8>> {
         self.container.read(self.id)

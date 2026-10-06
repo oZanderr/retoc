@@ -711,6 +711,19 @@ impl Toc {
     fn get_chunk_id_entry_index(&self, chunk_id: FIoChunkId) -> Result<u32> {
         self.chunk_id_map.get(&chunk_id).copied().with_context(|| "container does not contain entry for {chunk_id}")
     }
+    /// Whether any block of the entry is stored with a compression method, the blocks being what
+    /// [`Toc::read`] decompresses by.
+    pub fn any_block_compressed(&self, toc_entry_index: u32) -> bool {
+        let offset_and_length = &self.chunk_offset_lengths[toc_entry_index as usize];
+        let (offset, size) = (offset_and_length.get_offset(), offset_and_length.get_length());
+        let block_size = self.compression_block_size as u64;
+        if size == 0 || block_size == 0 {
+            return false;
+        }
+        let first = (offset / block_size) as usize;
+        let last = ((offset + size - 1) / block_size) as usize;
+        self.compression_blocks.get(first..=last).is_some_and(|blocks| blocks.iter().any(|block| block.get_compression_method_index() != 0))
+    }
     pub fn read<C: Read + Seek>(&self, cas_stream: &mut C, toc_entry_index: u32) -> Result<Vec<u8>> {
         let offset_and_length = &self.chunk_offset_lengths[toc_entry_index as usize];
         let offset = offset_and_length.get_offset();
@@ -830,6 +843,23 @@ mod test {
         let package_id = FPackageId::from_name("/ACLPlugin/ACLAnimBoneCompressionSettings");
         let _chunk_id = FIoChunkId::from_package_id(package_id, 0, EIoChunkType::ExportBundleData);
         // dbg!(chunk_id);
+    }
+
+    /// An entry counts as compressed when any of its own blocks is, whatever its meta flag says.
+    #[test]
+    fn an_entry_is_compressed_by_its_blocks() {
+        let mut toc = Toc::new();
+        toc.compression_block_size = 0x10000;
+        // Entry 0 spans blocks 0 and 1, the second compressed; entry 1 is block 2, raw.
+        toc.chunk_offset_lengths = vec![FIoOffsetAndLength::new(0, 0x18000), FIoOffsetAndLength::new(0x20000, 0x100), FIoOffsetAndLength::new(0x30000, 0)];
+        toc.compression_blocks = vec![
+            FIoStoreTocCompressedBlockEntry::new(0, 0x10000, 0x10000, 0),
+            FIoStoreTocCompressedBlockEntry::new(0x10000, 0x2000, 0x8000, 1),
+            FIoStoreTocCompressedBlockEntry::new(0x12000, 0x100, 0x100, 0),
+        ];
+        assert!(toc.any_block_compressed(0));
+        assert!(!toc.any_block_compressed(1));
+        assert!(!toc.any_block_compressed(2), "an empty entry has no blocks");
     }
 }
 
