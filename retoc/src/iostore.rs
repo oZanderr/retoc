@@ -382,11 +382,18 @@ pub struct IoStoreContainer {
 impl IoStoreContainer {
     pub fn open<P: AsRef<Path>>(toc_path: P, config: Arc<Config>) -> Result<Self> {
         let path = toc_path.as_ref().to_path_buf();
+        // A switched-off container is `X.utoc.disabled` beside `X.ucas.disabled`, and is still `X`.
+        let file_name = path.file_name().context("failed to get container name")?.to_string_lossy().into_owned();
+        let (base, suffix) = match file_name.strip_suffix(".disabled") {
+            Some(base) => (base, ".disabled"),
+            None => (file_name.as_str(), ""),
+        };
+        let name: String = Path::new(base).file_stem().context("failed to get container name")?.to_string_lossy().into();
         let toc: Toc = BufReader::new(fs::File::open(&path)?).de_ctx(config.clone())?;
-        let cas = FilePool::new(path.with_extension("ucas"), rayon::max_num_threads())?;
+        let cas = FilePool::new(path.with_file_name(format!("{name}.ucas{suffix}")), rayon::max_num_threads())?;
 
         let container = Self {
-            name: path.file_stem().context("failed to get container name")?.to_string_lossy().into(),
+            name,
             path,
             toc,
             cas,
@@ -518,6 +525,31 @@ mod test {
         let missing = dir.join("elsewhere").join("Missing_P.utoc");
         assert!(open_filtered_with(&dir, config, |_| true, &[missing]).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A switched-off container opens through its `.disabled` names, under the name it has on.
+    #[test]
+    fn test_open_disabled_container() -> Result<()> {
+        use crate::{UEPath, iostore_writer::IoStoreWriter};
+
+        let dir = std::env::temp_dir().join(format!("retoc-open-disabled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let id = FIoChunkIdRaw { id: [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 5] };
+        let mut writer = IoStoreWriter::new(dir.join("Off_P.utoc"), EIoStoreTocVersion::PerfectHashWithOverflow, None, "../../..".into(), None)?;
+        writer.write_chunk_raw(id, Some(UEPath::new("../../../Marvel/Content/Test/Payload.bin")), &payload)?;
+        writer.finalize()?;
+        for extension in ["utoc", "ucas"] {
+            std::fs::rename(dir.join(format!("Off_P.{extension}")), dir.join(format!("Off_P.{extension}.disabled")))?;
+        }
+
+        let container = IoStoreContainer::open(dir.join("Off_P.utoc.disabled"), Arc::new(Config::default()))?;
+        assert_eq!(container.container_name(), "Off_P");
+        assert_eq!(container.read_raw(id)?, payload);
+        drop(container);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
