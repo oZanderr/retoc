@@ -5,7 +5,7 @@ use std::io::{Read, Seek, Write};
 use strum::FromRepr;
 
 use crate::crc::generate_name_hash;
-use crate::name_map::{break_down_name_string, read_name_batch, write_name_batch};
+use crate::name_map::{break_down_name_string, compose_name_string, read_name_batch, write_name_batch};
 use crate::{FGuid, ser::*};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -107,7 +107,7 @@ fn read_fname<S: Read>(stream: &mut S, names: &[String]) -> Result<String> {
 
     if n & 0x80000000 != 0 {
         let number = stream.read_u32::<LE>()?;
-        Ok(format!("{}_{}", name, number - 1))
+        Ok(compose_name_string(name, number).into_owned())
     } else {
         Ok(name.clone())
     }
@@ -123,7 +123,8 @@ fn read_fname_pre_fixed_tags<S: Read>(stream: &mut S, names: &[String]) -> Resul
 
     let name = &names[index as usize];
 
-    if number > 0 { Ok(format!("{}_{}", name, number - 1)) } else { Ok(name.clone()) }
+    // The number is the engine's unsigned one, kept here as its bits
+    Ok(compose_name_string(name, number as u32).into_owned())
 }
 
 fn write_fname<S: Write>(stream: &mut S, value: &str, name_map: &IndexSet<&str>) -> Result<()> {

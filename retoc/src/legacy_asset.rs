@@ -1,6 +1,6 @@
 use crate::debug;
 use crate::logging::Log;
-use crate::name_map::break_down_name_string;
+use crate::name_map::{break_down_name_string, compose_name_string};
 use crate::version_heuristics::heuristic_package_version_from_legacy_package;
 use crate::zen::{EUnrealEngineObjectUE4Version, EUnrealEngineObjectUE5Version, FCustomVersion, FPackageFileVersion, FPackageIndex};
 use crate::{FGuid, ser::*};
@@ -630,7 +630,8 @@ impl FPackageNameMap {
     }
     pub fn get(&self, name: FMinimalName) -> Result<Cow<'_, str>> {
         let bare_name = self.names.get(name.index as usize).with_context(|| format!("invalid FName index {}", name.index))?;
-        Ok(if name.number != 0 { format!("{bare_name}_{}", name.number - 1).into() } else { bare_name.into() })
+        // The number is the engine's unsigned one, kept here as its bits
+        Ok(compose_name_string(bare_name, name.number as u32))
     }
     pub fn store(&mut self, name: &str) -> FMinimalName {
         let (name_without_number, name_number) = break_down_name_string(name);
@@ -1359,6 +1360,18 @@ mod test {
     use super::*;
     use crate::version::EngineVersion;
     use std::io::Cursor;
+
+    // A stored number with the top bit set is the engine's unsigned 2147483648, so the name shows 2147483647
+    #[test]
+    fn names_with_the_top_bit_of_their_number_set_round_trip() {
+        let mut names = FPackageNameMap::create();
+        for name in ["X_2147483647", "X_4294967294", "X_0", "X"] {
+            let stored = names.store(name);
+            assert_eq!(names.get(stored).unwrap(), name);
+        }
+        let stored = names.store("Y_2147483647");
+        assert_eq!(stored.number, i32::MIN);
+    }
 
     // The fields after the generations only read back when both sides agree on where the persistent GUID goes
     #[test]

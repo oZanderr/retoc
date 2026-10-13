@@ -24,24 +24,30 @@ fn name_header(name: &str) -> [u8; 2] {
     len.to_be_bytes()
 }
 
-/// Breaks down a combined FName string into a base name and a number. Number is 0 if there is no number
+/// Breaks down a combined FName string into a base name and a number. Number is 0 if there is no number.
+/// The engine's number is unsigned 32-bit, so the stored number is returned as its bits: `X_2147483647` is stored as 0x80000000
 pub(crate) fn break_down_name_string<'a>(name: &'a str) -> (&'a str, i32) {
     let mut name_without_number: &'a str = name;
     let mut name_number: i32 = 0; // 0 means no number
 
     // Attempt to break down the composite name into the name part and the number part
     if let Some((left, right)) = name.rsplit_once('_') {
-        // Right part needs to be parsed as a valid signed integer that is >= 0 and converts back to the same string
+        // Right part needs to be parsed as a valid unsigned integer below u32::MAX, so 1 more still fits, that converts back to the same string
         // Last part is important for not touching names like: Rocket_04 - 04 should stay a part of the name, not a number, otherwise we would actually get Rocket_4 when deserializing!
-        if let Ok(parsed_number) = right.parse::<i32>()
-            && parsed_number >= 0
+        if let Ok(parsed_number) = right.parse::<u32>()
+            && parsed_number < u32::MAX
             && parsed_number.to_string() == right
         {
             name_without_number = left;
-            name_number = parsed_number + 1; // stored as 1 more than the actual number
+            name_number = (parsed_number + 1) as i32; // stored as 1 more than the actual number
         }
     }
     (name_without_number, name_number)
+}
+
+/// The FName string for a base name and its stored number, the reverse of [`break_down_name_string`]: no suffix for 0, else the unsigned number less 1
+pub(crate) fn compose_name_string(name: &str, number: u32) -> Cow<'_, str> {
+    if number != 0 { format!("{name}_{}", number - 1).into() } else { name.into() }
 }
 
 pub fn read_name_batch<S: Read>(s: &mut S) -> Result<Vec<String>> {
@@ -170,8 +176,7 @@ impl FNameMap {
     }
     pub fn get(&self, name: FMappedName) -> Cow<'_, str> {
         assert_eq!(name.kind(), self.kind, "Attempt to map name of the different kind in this name map Name Kind is {}, but name map kind is {}", name.kind(), self.kind);
-        let n = &self.names[name.index() as usize];
-        if name.number != 0 { format!("{n}_{}", name.number - 1).into() } else { n.into() }
+        compose_name_string(&self.names[name.index() as usize], name.number)
     }
 
     pub fn store(&mut self, name: &str) -> FMappedName {
@@ -241,5 +246,38 @@ impl Writeable for FMappedName {
         stream.ser(&self.index_and_type)?;
         stream.ser(&self.number)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    // The engine's number is unsigned, so a stored number with the top bit set is a name like any other
+    #[test]
+    fn name_numbers_are_unsigned() {
+        assert_eq!(break_down_name_string("X_2147483647"), ("X", i32::MIN));
+        assert_eq!(break_down_name_string("X_4294967294"), ("X", -1));
+        assert_eq!(break_down_name_string("X_0"), ("X", 1));
+        assert_eq!(compose_name_string("X", 0x80000000), "X_2147483647");
+        assert_eq!(compose_name_string("X", u32::MAX), "X_4294967294");
+        assert_eq!(compose_name_string("X", 0), "X");
+    }
+
+    // A suffix that is no stored number stays part of the name
+    #[test]
+    fn suffixes_that_are_no_number_stay_in_the_name() {
+        for name in ["X_4294967295", "Rocket_04", "X_-1", "X_+1", "X_"] {
+            assert_eq!(break_down_name_string(name), (name, 0), "{name}");
+        }
+    }
+
+    #[test]
+    fn mapped_names_round_trip() {
+        let mut map = FNameMap::create(EMappedNameType::Package);
+        for name in ["X", "X_0", "X_2147483647", "X_4294967294", "X_4294967295", "Rocket_04"] {
+            let stored = map.store(name);
+            assert_eq!(map.get(stored), name);
+        }
     }
 }

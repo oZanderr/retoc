@@ -9,7 +9,7 @@ use tracing::instrument;
 
 use crate::align_usize;
 use crate::container_header::{EIoContainerHeaderVersion, StoreEntry};
-use crate::name_map::{EMappedNameType, break_down_name_string, read_name_batch, read_name_batch_parts, write_name_batch, write_name_batch_parts};
+use crate::name_map::{EMappedNameType, break_down_name_string, compose_name_string, read_name_batch, read_name_batch_parts, write_name_batch, write_name_batch_parts};
 use crate::script_objects::FPackageObjectIndex;
 use crate::ser::{WriteExt, Writeable};
 use crate::version_heuristics::{heuristic_zen_has_bulk_data, heuristic_zen_package_version};
@@ -781,7 +781,8 @@ impl Readable for FZenPackageImportedPackageNamesContainer {
         let imported_package_name_numbers: Vec<i32> = s.de_ctx(imported_package_names.len())?;
         for (name, number) in imported_package_names.iter_mut().zip(imported_package_name_numbers) {
             if number != 0 {
-                *name = format!("{name}_{}", number - 1)
+                let composed = compose_name_string(name, number as u32).into_owned();
+                *name = composed
             }
         }
         Ok(Self { imported_package_names })
