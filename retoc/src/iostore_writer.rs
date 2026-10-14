@@ -249,6 +249,52 @@ mod test {
         Ok(())
     }
 
+    /// A written TOC carries the engine's perfect hash: each chunk is where its seeds say, its file
+    /// is still named for it, and its data reads back. Uncompressed, so no Oodle library is needed.
+    #[test]
+    fn written_toc_finds_every_chunk_by_its_perfect_hash() -> Result<()> {
+        use crate::{Config, FIoChunkIdRaw, perfect_hash};
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("retoc-perfect-hash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let toc_path = dir.join("Hashed_P.utoc");
+
+        let mut writer = IoStoreWriter::new(&toc_path, EIoStoreTocVersion::PerfectHashWithOverflow, None, "../../..".into(), None)?;
+        let mut written = vec![];
+        for i in 0..97u32 {
+            let mut id = [0; 12];
+            id[..4].copy_from_slice(&i.wrapping_mul(0x9e37_79b9).to_le_bytes());
+            id[4..8].copy_from_slice(&i.to_le_bytes());
+            id[11] = if i % 3 == 0 { 3 } else { 2 };
+            let raw = FIoChunkIdRaw { id };
+            let data: Vec<u8> = (0..(100 + i * 7)).map(|b| (b ^ i) as u8).collect();
+            // A few chunks without a file, as bulk data and the container header have.
+            let path = (i % 10 != 0).then(|| format!("../../../Marvel/Content/Test/File{i}.uasset"));
+            writer.write_chunk_raw(raw, path.as_deref().map(UEPath::new), &data)?;
+            written.push((raw, path, data));
+        }
+        writer.finalize()?;
+
+        let raw_toc = fs::read(&toc_path)?;
+        let seeds_count = u32::from_le_bytes(raw_toc[84..88].try_into()?);
+        assert_eq!(seeds_count, 49, "half the 97 chunks, rounded");
+
+        let toc: Toc = std::io::BufReader::new(fs::File::open(&toc_path)?).de_ctx(Arc::new(Config::default()))?;
+        assert_eq!(toc.chunk_perfect_hash_seeds.len(), 49);
+        let mut cas = std::io::BufReader::new(fs::File::open(toc_path.with_extension("ucas"))?);
+        for (raw, path, data) in &written {
+            let slot = perfect_hash::slot_of(&toc.chunk_perfect_hash_seeds, toc.chunks.len(), &raw.id).expect("a slot");
+            assert_eq!(toc.chunks[slot].get_raw().id, raw.id);
+            assert_eq!(&toc.read(&mut cas, slot as u32)?, data);
+            assert_eq!(&toc.file_name(FIoChunkId::from_raw(FIoChunkIdRaw { id: raw.id }, toc.version)), path);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// Uncompressed on purpose: it exercises the encrypt path without needing an Oodle library.
     #[test]
     fn encrypted_container_round_trips() -> Result<()> {

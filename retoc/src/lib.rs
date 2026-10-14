@@ -11,6 +11,7 @@ pub mod legacy_asset;
 pub mod logging;
 pub mod manifest;
 pub mod name_map;
+pub mod perfect_hash;
 pub mod script_objects;
 pub mod ser;
 pub mod shader_library;
@@ -410,9 +411,10 @@ fn read_meta<S: Read>(s: &mut S, header: &FIoStoreTocHeader) -> Result<Vec<FIoSt
         Ok(FIoStoreTocEntryMeta { chunk_hash, flags })
     })
 }
+/// The chunks' metas, in `order`, the order the TOC lists its chunks in.
 #[instrument(skip_all)]
-fn write_meta<S: Write>(s: &mut S, toc: &Toc) -> Result<()> {
-    for meta in &toc.chunk_metas {
+fn write_meta<S: Write>(s: &mut S, toc: &Toc, order: &[usize]) -> Result<()> {
+    for meta in order.iter().map(|&index| &toc.chunk_metas[index]) {
         if toc.version >= EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash {
             s.write_all(&meta.chunk_hash.0[0..20])?;
             s.ser(&meta.flags)?;
@@ -589,8 +591,26 @@ impl Writeable for Toc {
         if self.container_flags.contains(EIoContainerFlags::Encrypted) {
             container_flags |= EIoContainerFlags::Encrypted;
         }
+        // The chunks go in the slots of the engine's perfect hash, so it finds them without
+        // building a map at mount. A TOC version from before the hash, or ids it cannot place,
+        // keep the order they have.
+        let arrangement = if self.version >= EIoStoreTocVersion::PerfectHash {
+            let ids: Vec<[u8; 12]> = self.chunks.iter().map(|chunk| chunk.get_raw().id).collect();
+            perfect_hash::arrange(&ids)
+        } else {
+            None
+        };
+        let (order, seeds) = match arrangement {
+            Some(arrangement) => (arrangement.order, arrangement.seeds),
+            None => ((0..self.chunks.len()).collect(), vec![]),
+        };
+        let mut slot_of_chunk = vec![0; order.len()];
+        for (slot, &index) in order.iter().enumerate() {
+            slot_of_chunk[index] = slot as u32;
+        }
+
         let mut directory_index_buffer = vec![];
-        self.directory_index.ser(&mut Cursor::new(&mut directory_index_buffer))?;
+        self.directory_index.ser_with_user_data(&mut Cursor::new(&mut directory_index_buffer), |user_data| slot_of_chunk.get(user_data as usize).copied().unwrap_or(user_data))?;
         // TODO encrypt directory index
 
         let header = FIoStoreTocHeader {
@@ -612,20 +632,21 @@ impl Writeable for Toc {
             container_flags,
             reserved3: 0,
             reserved4: 0,
-            toc_chunk_perfect_hash_seeds_count: 0,
+            toc_chunk_perfect_hash_seeds_count: seeds.len() as u32,
             partition_size: self.partition_size,
-            toc_chunks_without_perfect_hash_count: 0, // TODO
+            toc_chunks_without_perfect_hash_count: 0,
             reserved7: 0,
             reserved8: [0, 0, 0, 0, 0],
         };
         s.ser(&header)?;
 
-        s.ser_no_length(&self.chunks)?;
-        s.ser_no_length(&self.chunk_offset_lengths)?;
+        s.ser_no_length(&order.iter().map(|&index| self.chunks[index]).collect::<Vec<_>>())?;
+        s.ser_no_length(&order.iter().map(|&index| self.chunk_offset_lengths[index]).collect::<Vec<_>>())?;
+        s.ser_no_length(&seeds)?;
         s.ser_no_length(&self.compression_blocks)?;
         write_compression_methods(s, self)?;
         s.ser_no_length(&directory_index_buffer)?;
-        write_meta(s, self)?;
+        write_meta(s, self, &order)?;
 
         Ok(())
     }
@@ -1474,16 +1495,22 @@ mod directory_index {
     }
     impl Writeable for FIoDirectoryIndexResource {
         fn ser<S: Write>(&self, s: &mut S) -> Result<()> {
+            self.ser_with_user_data(s, |user_data| user_data)
+        }
+    }
+    impl FIoDirectoryIndexResource {
+        /// Writes the index with each file's user data, the TOC entry it names, passed through
+        /// `user_data`, for a TOC that lists its chunks in another order than the index was built in.
+        pub fn ser_with_user_data<S: Write>(&self, s: &mut S, user_data: impl Fn(u32) -> u32) -> Result<()> {
             if !self.file_entries.is_empty() {
                 s.ser(&self.mount_point.as_str())?;
                 s.ser(&self.directory_entries)?;
-                s.ser(&self.file_entries)?;
+                let files: Vec<FIoFileIndexEntry> = self.file_entries.iter().map(|file| FIoFileIndexEntry { user_data: user_data(file.user_data), ..*file }).collect();
+                s.ser(&files)?;
                 s.ser(&self.string_table)?;
             }
             Ok(())
         }
-    }
-    impl FIoDirectoryIndexResource {
         pub fn iter_root<F>(&self, mut visitor: F)
         where
             F: FnMut(u32, &[&str]),
@@ -1647,7 +1674,7 @@ mod directory_index {
     new_id!(IdDir);
     new_id!(IdName);
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     struct FIoFileIndexEntry {
         name: IdName,
         next_file_entry: Option<IdFile>,
