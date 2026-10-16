@@ -816,6 +816,125 @@ impl Toc {
         data.truncate(size as usize);
         Ok(data)
     }
+    /// The entry as the container stores it, its blocks decrypted but still compressed, for
+    /// copying into another container without compressing it again. Every block is decompressed
+    /// once to hash the data, so a corrupt block fails here as it would in [`Toc::read`]. `None`
+    /// when the entry is not laid out the way a copy needs: empty, memory mapped, not starting on
+    /// a block, or with blocks that do not tile it at the block size.
+    pub fn read_stored<C: Read + Seek>(&self, cas_stream: &mut C, toc_entry_index: u32) -> Result<Option<StoredChunk>> {
+        let offset_and_length = &self.chunk_offset_lengths[toc_entry_index as usize];
+        let (offset, size) = (offset_and_length.get_offset(), offset_and_length.get_length());
+        let block_size = self.compression_block_size as u64;
+        let memory_mapped = self.chunk_metas.get(toc_entry_index as usize).is_some_and(|meta| meta.flags.contains(FIoStoreTocEntryMetaFlags::MemoryMapped));
+        if size == 0 || block_size == 0 || offset % block_size != 0 || memory_mapped {
+            return Ok(None);
+        }
+        let first = (offset / block_size) as usize;
+        let count = size.div_ceil(block_size) as usize;
+        let Some(entries) = self.compression_blocks.get(first..first + count) else {
+            return Ok(None);
+        };
+        let aes_key = if self.container_flags.contains(EIoContainerFlags::Encrypted) {
+            Some(self.config.aes_keys.get(&self.encryption_key_guid).with_context(|| format!("container is encrypted but no AES key for {:?} supplied", self.encryption_key_guid))?)
+        } else {
+            None
+        };
+        let cas_len = cas_stream.seek(SeekFrom::End(0))?;
+        let stored_len = |block: &FIoStoreTocCompressedBlockEntry| {
+            let compressed = block.get_compressed_size() as u64;
+            if aes_key.is_some() { align_u64(compressed, 16) } else { compressed }
+        };
+        let mut total = 0u64;
+        for (at, block) in entries.iter().enumerate() {
+            let uncompressed = block.get_uncompressed_size() as u64;
+            let compressed = block.get_compressed_size() as u64;
+            let method_index = block.get_compression_method_index() as usize;
+            let last = at + 1 == entries.len();
+            let tiles = uncompressed > 0 && uncompressed <= block_size && (last || uncompressed == block_size);
+            let raw_whole = method_index != 0 || compressed == uncompressed;
+            let fits = block.get_offset().checked_add(stored_len(block)).is_some_and(|end| end <= cas_len);
+            if !tiles || compressed == 0 || method_index > self.compression_methods.len() || !raw_whole || !fits {
+                return Ok(None);
+            }
+            total += uncompressed;
+        }
+        if total != size {
+            return Ok(None);
+        }
+
+        use aes::cipher::BlockDecrypt;
+        let mut blocks = Vec::with_capacity(entries.len());
+        for block in entries {
+            let mut bytes = vec![0; stored_len(block) as usize];
+            cas_stream.seek(SeekFrom::Start(block.get_offset()))?;
+            cas_stream.read_exact(&mut bytes)?;
+            if let Some(key) = aes_key {
+                for aes_block in bytes.chunks_mut(16) {
+                    key.0.decrypt_block(aes_block.into());
+                }
+            }
+            bytes.truncate(block.get_compressed_size() as usize);
+            let method_index = block.get_compression_method_index() as usize;
+            blocks.push(StoredBlock {
+                method: (method_index != 0).then(|| self.compression_methods[method_index - 1]),
+                uncompressed_size: block.get_uncompressed_size(),
+                bytes,
+            });
+        }
+        let chunk = StoredChunk {
+            block_size: self.compression_block_size,
+            size,
+            blocks,
+            hash: [0; 32],
+        };
+        let hash = blake3::hash(&chunk.decompress()?);
+        Ok(Some(StoredChunk { hash: *hash.as_bytes(), ..chunk }))
+    }
+}
+
+/// One block of a chunk as its container stores it: compressed with `method`, or raw when that is
+/// `None`, decrypted and without the padding encryption adds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredBlock {
+    pub method: Option<CompressionMethod>,
+    pub uncompressed_size: u32,
+    pub bytes: Vec<u8>,
+}
+
+impl StoredBlock {
+    /// The block's data.
+    pub fn decompress(&self) -> Result<Vec<u8>> {
+        match self.method {
+            None => Ok(self.bytes.clone()),
+            Some(method) => {
+                let mut out = vec![0; self.uncompressed_size as usize];
+                decompress(method, &self.bytes, &mut out)?;
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// A chunk as its container stores it, for writing into another container as it is: see
+/// [`iostore_writer::IoStoreWriter::write_stored`].
+#[derive(Debug, Clone)]
+pub struct StoredChunk {
+    /// The block size of the container the chunk was read from, which every block but the last
+    /// holds exactly.
+    pub block_size: u32,
+    pub size: u64,
+    pub blocks: Vec<StoredBlock>,
+    /// The blake3 hash of the chunk's data, from its blocks decompressed when it was read.
+    pub hash: [u8; 32],
+}
+
+impl StoredChunk {
+    /// The chunk's data, every block decompressed, in parallel.
+    pub fn decompress(&self) -> Result<Vec<u8>> {
+        use rayon::prelude::*;
+        let parts = self.blocks.par_iter().map(StoredBlock::decompress).collect::<Result<Vec<_>>>()?;
+        Ok(parts.concat())
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -881,6 +1000,51 @@ mod test {
         assert!(toc.any_block_compressed(0));
         assert!(!toc.any_block_compressed(1));
         assert!(!toc.any_block_compressed(2), "an empty entry has no blocks");
+    }
+
+    /// One entry of 40 bytes in blocks of 16 over a cas of `cas` bytes: raw blocks of 16, 16 and 8.
+    fn tiled(cas: usize) -> (Toc, Vec<u8>) {
+        let mut toc = Toc::new();
+        toc.compression_block_size = 16;
+        toc.compression_methods = vec![CompressionMethod::Zlib];
+        toc.chunk_offset_lengths = vec![FIoOffsetAndLength::new(0, 40)];
+        toc.chunk_metas = vec![FIoStoreTocEntryMeta { chunk_hash: FIoChunkHash([0; 32]), flags: FIoStoreTocEntryMetaFlags::empty() }];
+        toc.compression_blocks = vec![
+            FIoStoreTocCompressedBlockEntry::new(0, 16, 16, 0),
+            FIoStoreTocCompressedBlockEntry::new(16, 16, 16, 0),
+            FIoStoreTocCompressedBlockEntry::new(32, 8, 8, 0),
+        ];
+        (toc, (0..cas).map(|b| b as u8).collect())
+    }
+
+    /// An entry tiled by its blocks reads as stored, hashed from its data; one laid out any other
+    /// way is left to a plain read, and a block that does not decompress fails.
+    #[test]
+    fn a_stored_read_takes_only_entries_its_blocks_tile() {
+        let read = |toc: &Toc, cas: &[u8]| toc.read_stored(&mut Cursor::new(cas), 0);
+
+        let (toc, cas) = tiled(40);
+        let stored = read(&toc, &cas).unwrap().expect("tiled");
+        assert_eq!(stored.blocks.len(), 3);
+        assert_eq!(stored.decompress().unwrap(), cas);
+        assert_eq!(&stored.hash, blake3::hash(&cas).as_bytes());
+
+        let refused = |change: &dyn Fn(&mut Toc), cas_len: usize, why: &str| {
+            let (mut toc, cas) = tiled(cas_len);
+            change(&mut toc);
+            assert!(read(&toc, &cas).unwrap().is_none(), "{why}");
+        };
+        refused(&|toc| toc.compression_blocks[1] = FIoStoreTocCompressedBlockEntry::new(16, 12, 12, 0), 40, "a short middle block");
+        refused(&|toc| toc.compression_blocks[2] = FIoStoreTocCompressedBlockEntry::new(32, 8, 8, 2), 40, "a method past the table");
+        refused(&|toc| toc.compression_blocks[2] = FIoStoreTocCompressedBlockEntry::new(32, 6, 8, 0), 40, "a raw block of two sizes");
+        refused(&|_| {}, 39, "a block past the cas");
+        refused(&|toc| toc.chunk_offset_lengths[0] = FIoOffsetAndLength::new(0, 0), 40, "an empty entry");
+        refused(&|toc| toc.chunk_offset_lengths[0] = FIoOffsetAndLength::new(8, 32), 40, "an entry inside a block");
+        refused(&|toc| toc.chunk_metas[0].flags = FIoStoreTocEntryMetaFlags::MemoryMapped, 40, "a memory mapped entry");
+
+        let (mut toc, cas) = tiled(40);
+        toc.compression_blocks[2] = FIoStoreTocCompressedBlockEntry::new(32, 8, 8, 1);
+        assert!(read(&toc, &cas).is_err(), "a block that does not decompress");
     }
 }
 

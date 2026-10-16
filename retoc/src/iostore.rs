@@ -176,6 +176,12 @@ impl ChunkInfo<'_> {
     pub fn read(&self) -> Result<Vec<u8>> {
         self.container.read(self.id)
     }
+    /// The chunk as its container stores it, for writing into another container without
+    /// compressing it again: see [`crate::iostore_writer::IoStoreWriter::write_stored`]. `None`
+    /// when its blocks are not laid out the way a copy needs, and it is read and written again.
+    pub fn read_stored(&self) -> Result<Option<crate::StoredChunk>> {
+        self.container.read_stored(self.id)
+    }
 }
 impl std::cmp::Eq for ChunkInfo<'_> {}
 impl std::cmp::PartialEq for ChunkInfo<'_> {
@@ -425,6 +431,14 @@ impl IoStoreContainer {
     #[allow(unused)]
     pub fn container_path(&self) -> &Path {
         self.path.as_ref()
+    }
+
+    /// A chunk as this container stores it: see [`ChunkInfo::read_stored`].
+    pub fn read_stored(&self, chunk_id: FIoChunkId) -> Result<Option<crate::StoredChunk>> {
+        let chunk_id = chunk_id.with_version(self.toc.version);
+        let index = *self.toc.chunk_id_map.get(&chunk_id).with_context(|| format!("container {:?} does not contain {:?}", self.name, chunk_id))?;
+        let mut file_lock = self.cas.acquire()?;
+        self.toc.read_stored(&mut file_lock.file(), index).with_context(|| format!("Failed to read chunk {chunk_id:?} as stored"))
     }
 }
 impl IoStoreTrait for IoStoreContainer {

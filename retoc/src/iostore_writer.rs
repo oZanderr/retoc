@@ -15,6 +15,37 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// A block compressed with `method` at `level`, or the block as it is with method index 0 when that
+/// does not make it smaller. Index 1 is a writer's one compression method.
+fn compress_block(method: CompressionMethod, level: Option<CompressionLevel>, block: &[u8]) -> Result<(Vec<u8>, u8)> {
+    let mut buf = Vec::new();
+    compression::compress(method, level, block, &mut buf)?;
+    if buf.len() < block.len() { Ok((buf, 1)) } else { Ok((block.to_vec(), 0)) }
+}
+
+/// A stored block as a writer compressing with `mine` at `level` writes it: its bytes, its method
+/// index, and whether it was compressed again. A raw block and one already in `mine` are borrowed
+/// as they are; only one in another method takes a buffer.
+fn prepare_stored_block(block: &crate::StoredBlock, mine: Option<CompressionMethod>, level: Option<CompressionLevel>) -> Result<(std::borrow::Cow<'_, [u8]>, u8, bool)> {
+    Ok(match (block.method, mine) {
+        (None, _) => (block.bytes.as_slice().into(), 0, false),
+        (Some(method), Some(own)) if method == own => (block.bytes.as_slice().into(), 1, false),
+        (Some(_), Some(own)) => {
+            let (bytes, index) = compress_block(own, level, &block.decompress()?)?;
+            (bytes.into(), index, true)
+        }
+        (Some(_), None) => (block.decompress()?.into(), 0, true),
+    })
+}
+
+/// How [`IoStoreWriter::write_stored`] wrote a chunk's blocks: copied as they were stored, or
+/// decompressed and written again.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StoredCopy {
+    pub copied: usize,
+    pub recompressed: usize,
+}
+
 pub struct IoStoreWriter {
     #[allow(unused)]
     toc_path: PathBuf,
@@ -94,101 +125,131 @@ impl IoStoreWriter {
         self.write_chunk_inner(chunk_id, path, data, false)
     }
     fn write_chunk_inner(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8], compress: bool) -> Result<()> {
-        if let Some(path) = path {
-            let index = &mut self.toc.directory_index;
-            let relative_path = path.strip_prefix(&index.mount_point).with_context(|| format!("mount point {} does not contain path {path}", index.mount_point))?;
-            index.add_file(relative_path, self.toc.chunks.len() as u32);
-        }
-
-        let mut offset = self.cas_offset;
-
-        let start_block = self.toc.compression_blocks.len();
-
+        let start_block = self.begin_chunk(path)?;
         let active_compression = if compress { self.compression_method } else { None };
-        // compression_method_index: 0 = None, 1 = first entry in compression_methods vec
-        let compression_method_index: u8 = if active_compression.is_some() { 1 } else { 0 };
-
         let block_size = self.toc.compression_block_size as usize;
         let blocks: Vec<&[u8]> = data.chunks(block_size).collect();
-        let level = self.compression_level;
 
         // Hash the full payload in one pass. blake3 is SIMD-accelerated; faster than
         // per-block update accumulation in practice.
         let hash = blake3::hash(data);
 
-        // Slab compress so the per-chunk scratch is bounded; sized at 2 blocks
-        // per worker to amortize rayon dispatch without over-buffering.
-        let slab_blocks = rayon::current_num_threads()
-            .max(1)
-            .saturating_mul(2)
-            .min(blocks.len().max(1));
-
         let mut any_block_compressed = false;
-        for slab in blocks.chunks(slab_blocks) {
-            let compressed: Vec<(Vec<u8>, u8)> = if let Some(method) = active_compression {
-                let compress_block = |block: &&[u8]| -> Result<(Vec<u8>, u8)> {
-                    let mut buf = Vec::new();
-                    compression::compress(method, level, block, &mut buf)?;
-                    if buf.len() < block.len() {
-                        Ok((buf, compression_method_index))
+        for slab in blocks.chunks(self.slab_blocks(blocks.len())) {
+            let compressed: Vec<(Vec<u8>, u8)> = match active_compression {
+                Some(method) => {
+                    let level = self.compression_level;
+                    let compress_block = |block: &&[u8]| compress_block(method, level, block);
+                    // Handing one block to rayon parallelises nothing and costs the calling thread a
+                    // park/unpark round trip, and most package chunks are a single block.
+                    if slab.len() < 2 {
+                        slab.iter().map(compress_block).collect::<Result<Vec<_>>>()?
                     } else {
-                        Ok((block.to_vec(), 0))
+                        slab.par_iter().map(compress_block).collect::<Result<Vec<_>>>()?
                     }
-                };
-                // Handing one block to rayon parallelises nothing and costs the calling thread a
-                // park/unpark round trip, and most package chunks are a single block.
-                if slab.len() < 2 {
-                    slab.iter().map(compress_block).collect::<Result<Vec<_>>>()?
-                } else {
-                    slab.par_iter().map(compress_block).collect::<Result<Vec<_>>>()?
                 }
-            } else {
-                slab.iter().map(|block| (block.to_vec(), 0)).collect()
+                None => slab.iter().map(|block| (block.to_vec(), 0)).collect(),
             };
-
-            for ((written_bytes, actual_method_index), block) in compressed.iter().zip(slab.iter()) {
-                let compressed_size = written_bytes.len() as u32;
-                let uncompressed_size = block.len() as u32;
-                if *actual_method_index != 0 {
-                    any_block_compressed = true;
-                }
-                // Encrypted blocks are stored padded out to the AES block size while the entry
-                // keeps the unpadded length, which is what the read path aligns back up.
-                let stored_size = match &self.encryption {
-                    Some(key) => {
-                        use aes::cipher::BlockEncrypt;
-                        let mut padded = written_bytes.clone();
-                        padded.resize(align_usize(padded.len(), 16), 0);
-                        for aes_block in padded.chunks_mut(16) {
-                            key.0.encrypt_block(aes_block.into());
-                        }
-                        self.cas_stream.write_all(&padded)?;
-                        padded.len() as u64
-                    }
-                    None => {
-                        self.cas_stream.write_all(written_bytes)?;
-                        compressed_size as u64
-                    }
-                };
-                self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(offset, compressed_size, uncompressed_size, *actual_method_index));
-                offset += stored_size;
+            for ((written_bytes, method_index), block) in compressed.iter().zip(slab.iter()) {
+                any_block_compressed |= *method_index != 0;
+                self.emit_block(written_bytes, block.len() as u32, *method_index)?;
             }
         }
-        let flags = if any_block_compressed { FIoStoreTocEntryMetaFlags::Compressed } else { FIoStoreTocEntryMetaFlags::empty() };
-        let meta = FIoStoreTocEntryMeta {
-            chunk_hash: FIoChunkHash::from_blake3(hash.as_bytes()),
-            flags,
+        self.end_chunk(chunk_id, start_block, data.len() as u64, hash.as_bytes(), any_block_compressed);
+        Ok(())
+    }
+
+    /// Writes a chunk another container stores as it is stored: a block in this writer's own
+    /// compression is copied, a raw one stays raw, and one in any other method is decompressed and
+    /// compressed again in this writer's, or kept raw where that does not make it smaller. A chunk
+    /// stored at another block size is written again from its data. `store_entry` makes it a
+    /// package's export bundle, as [`Self::write_package_chunk`] does.
+    pub fn write_stored(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, stored: &crate::StoredChunk, store_entry: Option<&StoreEntry>) -> Result<StoredCopy> {
+        if let Some(store_entry) = store_entry {
+            let container_header = self.container_header.as_mut().expect("FIoContainerHeader is required to write package chunks");
+            container_header.add_package(FPackageId(chunk_id.get_chunk_id()), store_entry.clone());
+        }
+        if stored.block_size != self.toc.compression_block_size {
+            let compress = stored.blocks.iter().any(|block| block.method.is_some());
+            let data = stored.decompress()?;
+            self.write_chunk_inner(chunk_id, path, &data, compress)?;
+            let blocks = data.len().div_ceil(self.toc.compression_block_size as usize);
+            return Ok(StoredCopy { copied: 0, recompressed: blocks });
+        }
+
+        let start_block = self.begin_chunk(path)?;
+        let (mine, level) = (self.compression_method, self.compression_level);
+        let mut copy = StoredCopy::default();
+        let mut any_block_compressed = false;
+        for slab in stored.blocks.chunks(self.slab_blocks(stored.blocks.len())) {
+            let prepared = if slab.iter().filter(|block| block.method.is_some() && block.method != mine).count() < 2 {
+                slab.iter().map(|block| prepare_stored_block(block, mine, level)).collect::<Result<Vec<_>>>()?
+            } else {
+                slab.par_iter().map(|block| prepare_stored_block(block, mine, level)).collect::<Result<Vec<_>>>()?
+            };
+            for ((bytes, index, again), block) in prepared.iter().zip(slab) {
+                any_block_compressed |= *index != 0;
+                if *again {
+                    copy.recompressed += 1;
+                } else {
+                    copy.copied += 1;
+                }
+                self.emit_block(bytes, block.uncompressed_size, *index)?;
+            }
+        }
+        self.end_chunk(chunk_id, start_block, stored.size, &stored.hash, any_block_compressed);
+        Ok(copy)
+    }
+
+    /// How many blocks go to the compressor at once: two per worker amortises rayon's dispatch
+    /// without buffering much.
+    fn slab_blocks(&self, blocks: usize) -> usize {
+        rayon::current_num_threads().max(1).saturating_mul(2).min(blocks.max(1))
+    }
+
+    /// Files a chunk under its path, and gives the block its data starts at.
+    fn begin_chunk(&mut self, path: Option<&UEPath>) -> Result<usize> {
+        if let Some(path) = path {
+            let index = &mut self.toc.directory_index;
+            let relative_path = path.strip_prefix(&index.mount_point).with_context(|| format!("mount point {} does not contain path {path}", index.mount_point))?;
+            index.add_file(relative_path, self.toc.chunks.len() as u32);
+        }
+        Ok(self.toc.compression_blocks.len())
+    }
+
+    /// Writes one block, encrypted when the container is, and adds its entry.
+    fn emit_block(&mut self, bytes: &[u8], uncompressed_size: u32, method_index: u8) -> Result<()> {
+        // Encrypted blocks are stored padded out to the AES block size while the entry keeps the
+        // unpadded length, which is what the read path aligns back up.
+        let stored_size = match &self.encryption {
+            Some(key) => {
+                use aes::cipher::BlockEncrypt;
+                let mut padded = bytes.to_vec();
+                padded.resize(align_usize(padded.len(), 16), 0);
+                for aes_block in padded.chunks_mut(16) {
+                    key.0.encrypt_block(aes_block.into());
+                }
+                self.cas_stream.write_all(&padded)?;
+                padded.len() as u64
+            }
+            None => {
+                self.cas_stream.write_all(bytes)?;
+                bytes.len() as u64
+            }
         };
+        self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(self.cas_offset, bytes.len() as u32, uncompressed_size, method_index));
+        self.cas_offset += stored_size;
+        Ok(())
+    }
 
-        self.cas_offset = offset;
-
-        let offset_and_length = FIoOffsetAndLength::new(start_block as u64 * self.toc.compression_block_size as u64, data.len() as u64);
-
+    /// Records a chunk whose blocks start at `start_block`.
+    fn end_chunk(&mut self, chunk_id: FIoChunkId, start_block: usize, size: u64, hash: &[u8; 32], any_block_compressed: bool) {
+        let flags = if any_block_compressed { FIoStoreTocEntryMetaFlags::Compressed } else { FIoStoreTocEntryMetaFlags::empty() };
+        let meta = FIoStoreTocEntryMeta { chunk_hash: FIoChunkHash::from_blake3(hash), flags };
+        let offset_and_length = FIoOffsetAndLength::new(start_block as u64 * self.toc.compression_block_size as u64, size);
         self.toc.chunks.push(chunk_id.with_version(self.toc.version));
         self.toc.chunk_offset_lengths.push(offset_and_length);
         self.toc.chunk_metas.push(meta);
-
-        Ok(())
     }
 
     pub fn write_package_chunk(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8], store_entry: &StoreEntry) -> Result<()> {
@@ -339,6 +400,154 @@ mod test {
         assert_eq!(toc.read(&mut cas, 0)?, payload);
 
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Chunks for the stored-copy tests: compressible ones across several blocks, one that does
+    /// not compress, so it is stored raw, and one shorter than a block.
+    fn stored_payloads() -> Vec<Vec<u8>> {
+        let mut noise = 0x2545_f491u32;
+        let incompressible: Vec<u8> = (0..70_000)
+            .map(|_| {
+                noise ^= noise << 13;
+                noise ^= noise >> 17;
+                noise ^= noise << 5;
+                noise as u8
+            })
+            .collect();
+        vec![(0..300_003u32).map(|i| (i % 251) as u8).collect(), incompressible, b"short".repeat(30)]
+    }
+
+    struct Written {
+        dir: PathBuf,
+        toc: PathBuf,
+        payloads: Vec<Vec<u8>>,
+    }
+
+    /// A container of [`stored_payloads`] in `method`, blocks of `block_size`, encrypted with `key`.
+    fn written(tag: &str, method: Option<CompressionMethod>, block_size: u32, key: Option<&AesKey>) -> Result<Written> {
+        let dir = std::env::temp_dir().join(format!("retoc-stored-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let toc = dir.join("Source_P.utoc");
+        let mut writer = IoStoreWriter::new(&toc, EIoStoreTocVersion::PerfectHashWithOverflow, None, "../../..".into(), method)?.with_compression_block_size(block_size);
+        if let Some(key) = key {
+            writer = writer.with_encryption(key.clone());
+        }
+        let payloads = stored_payloads();
+        for (at, data) in payloads.iter().enumerate() {
+            let path = format!("../../../Marvel/Content/Stored/Chunk{at}.bin");
+            writer.write_chunk(FIoChunkId::create(at as u64 + 7, 0, EIoChunkType::BulkData), Some(UEPath::new(&path)), data)?;
+        }
+        writer.finalize()?;
+        Ok(Written { dir, toc, payloads })
+    }
+
+    const STORED_KEY: &str = "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
+
+    fn keyed_config() -> Result<std::sync::Arc<crate::Config>> {
+        let key: AesKey = STORED_KEY.parse()?;
+        Ok(std::sync::Arc::new(crate::Config {
+            aes_keys: std::collections::HashMap::from([(crate::FGuid::default(), key)]),
+            ..Default::default()
+        }))
+    }
+
+    /// Copies every chunk of `from` into a new container written by `into`, and gives what the
+    /// copies came to, with the new container open.
+    fn copy_stored(from: &Written, into: IoStoreWriter, into_toc: &Path) -> Result<(StoredCopy, crate::iostore::IoStoreContainer)> {
+        use crate::iostore::{IoStoreContainer, IoStoreTrait};
+        let source = IoStoreContainer::open(&from.toc, keyed_config()?)?;
+        let mut into = into;
+        let mut total = StoredCopy::default();
+        for chunk in source.chunks() {
+            let stored = chunk.read_stored()?.expect("stored");
+            assert_eq!(stored.decompress()?, chunk.read()?);
+            let path = chunk.path();
+            let copy = into.write_stored(chunk.id(), path.as_deref().map(UEPath::new), &stored, None)?;
+            total.copied += copy.copied;
+            total.recompressed += copy.recompressed;
+        }
+        into.finalize()?;
+        Ok((total, IoStoreContainer::open(into_toc, keyed_config()?)?))
+    }
+
+    /// Every chunk of `copy` reads back as its payload, under its path, with its blake3 hash.
+    fn holds_payloads(copy: &crate::iostore::IoStoreContainer, payloads: &[Vec<u8>]) -> Result<()> {
+        use crate::iostore::IoStoreTrait;
+        for (at, data) in payloads.iter().enumerate() {
+            let id = FIoChunkId::create(at as u64 + 7, 0, EIoChunkType::BulkData);
+            assert_eq!(&copy.read(id)?, data, "chunk {at}");
+            assert_eq!(copy.chunk_path(id).as_deref(), Some(format!("../../../Marvel/Content/Stored/Chunk{at}.bin").as_str()));
+            let chunk = copy.chunks().find(|chunk| chunk.id() == id.with_version(EIoStoreTocVersion::PerfectHashWithOverflow)).expect("listed");
+            assert_eq!(chunk.hash().0[..20], blake3::hash(data).as_bytes()[..20], "chunk {at}'s hash");
+        }
+        Ok(())
+    }
+
+    /// Blocks in the copy's own compression are copied byte for byte, plain or encrypted on either
+    /// side, and every chunk reads back whole.
+    #[test]
+    fn stored_blocks_copy_between_plain_and_encrypted_containers() -> Result<()> {
+        let key: AesKey = STORED_KEY.parse()?;
+        for (from_key, into_key) in [(None, None), (None, Some(&key)), (Some(&key), None), (Some(&key), Some(&key))] {
+            let tag = format!("{}{}", from_key.is_some() as u8, into_key.is_some() as u8);
+            let from = written(&format!("from{tag}"), Some(CompressionMethod::Zlib), 0x10000, from_key)?;
+            let into_toc = from.dir.join("Copy_P.utoc");
+            let mut into = IoStoreWriter::new(&into_toc, EIoStoreTocVersion::PerfectHashWithOverflow, None, "../../..".into(), Some(CompressionMethod::Zlib))?.with_compression_block_size(0x10000);
+            if let Some(key) = into_key {
+                into = into.with_encryption(key.clone());
+            }
+            let (copy, opened) = copy_stored(&from, into, &into_toc)?;
+            assert_eq!(copy.recompressed, 0, "{tag}");
+            assert!(copy.copied >= 6, "{tag}: {copy:?}");
+            holds_payloads(&opened, &from.payloads)?;
+            let source = crate::iostore::IoStoreContainer::open(&from.toc, keyed_config()?)?;
+            for at in 0..from.payloads.len() {
+                let id = FIoChunkId::create(at as u64 + 7, 0, EIoChunkType::BulkData);
+                assert_eq!(source.read_stored(id)?.expect("stored").blocks, opened.read_stored(id)?.expect("stored").blocks, "{tag}: chunk {at}'s blocks");
+            }
+            let _ = std::fs::remove_dir_all(&from.dir);
+        }
+        Ok(())
+    }
+
+    /// A block in another method is compressed again in the copy's, a raw one stays raw, a copy
+    /// without compression stores every block raw, and one at another block size is written again
+    /// at its own.
+    #[test]
+    fn stored_blocks_in_another_method_or_block_size_are_written_again() -> Result<()> {
+        let from = written("methods", Some(CompressionMethod::Zlib), 0x10000, None)?;
+        let compressed_blocks = 300_003usize.div_ceil(0x10000) + 1;
+
+        let zstd_toc = from.dir.join("Zstd_P.utoc");
+        let zstd = IoStoreWriter::new(&zstd_toc, EIoStoreTocVersion::PerfectHashWithOverflow, None, "../../..".into(), Some(CompressionMethod::Zstd))?.with_compression_block_size(0x10000);
+        let (copy, opened) = copy_stored(&from, zstd, &zstd_toc)?;
+        assert_eq!(copy.recompressed, compressed_blocks, "{copy:?}");
+        assert_eq!(copy.copied, 70_000usize.div_ceil(0x10000), "the raw blocks: {copy:?}");
+        holds_payloads(&opened, &from.payloads)?;
+        let first = opened.read_stored(FIoChunkId::create(7, 0, EIoChunkType::BulkData))?.expect("stored");
+        assert!(first.blocks.iter().all(|block| block.method == Some(CompressionMethod::Zstd)));
+        drop(opened);
+
+        let plain_toc = from.dir.join("Plain_P.utoc");
+        let plain = IoStoreWriter::new(&plain_toc, EIoStoreTocVersion::PerfectHashWithOverflow, None, "../../..".into(), None)?.with_compression_block_size(0x10000);
+        let (_, opened) = copy_stored(&from, plain, &plain_toc)?;
+        holds_payloads(&opened, &from.payloads)?;
+        let first = opened.read_stored(FIoChunkId::create(7, 0, EIoChunkType::BulkData))?.expect("stored");
+        assert!(first.blocks.iter().all(|block| block.method.is_none()));
+        drop(opened);
+
+        let wide_toc = from.dir.join("Wide_P.utoc");
+        let wide = IoStoreWriter::new(&wide_toc, EIoStoreTocVersion::PerfectHashWithOverflow, None, "../../..".into(), Some(CompressionMethod::Zlib))?.with_compression_block_size(0x20000);
+        let (copy, opened) = copy_stored(&from, wide, &wide_toc)?;
+        assert_eq!(copy.copied, 0, "{copy:?}");
+        holds_payloads(&opened, &from.payloads)?;
+        let first = opened.read_stored(FIoChunkId::create(7, 0, EIoChunkType::BulkData))?.expect("stored");
+        assert_eq!(first.blocks.len(), 300_003usize.div_ceil(0x20000));
+        drop(opened);
+
+        let _ = std::fs::remove_dir_all(&from.dir);
         Ok(())
     }
 }
