@@ -174,8 +174,8 @@ impl FNameMap {
         }
         Self { kind, names, name_lookup }
     }
+    /// Resolves by index and number alone: the shipping engine never checks the type bits, and some packers write the wrong ones
     pub fn get(&self, name: FMappedName) -> Cow<'_, str> {
-        assert_eq!(name.kind(), self.kind, "Attempt to map name of the different kind in this name map Name Kind is {}, but name map kind is {}", name.kind(), self.kind);
         compose_name_string(&self.names[name.index() as usize], name.number)
     }
 
@@ -262,6 +262,13 @@ mod test {
         assert_eq!(compose_name_string("X", 0x80000000), "X_2147483647");
         assert_eq!(compose_name_string("X", u32::MAX), "X_4294967294");
         assert_eq!(compose_name_string("X", 0), "X");
+    }
+
+    #[test]
+    fn names_resolve_whatever_their_type_bits() {
+        let map = FNameMap::create_from_names(EMappedNameType::Container, vec!["/Game/Marvel/Characters/Common/TeamOutlineColor".to_string()]);
+        let mislabelled = FMappedName::create(0, EMappedNameType::Package, 0);
+        assert_eq!(map.get(mislabelled), "/Game/Marvel/Characters/Common/TeamOutlineColor");
     }
 
     // A suffix that is no stored number stays part of the name
