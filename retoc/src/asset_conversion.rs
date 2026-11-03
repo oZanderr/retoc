@@ -70,6 +70,26 @@ impl<'a> FZenPackageContext<'a> {
         self.extra_script_objects = paths;
         self
     }
+    /// A context over the same store sharing this one's script object table, with caches of its
+    /// own, for a walk that drops its caches now and then without building the table again.
+    pub fn sibling(&self) -> Self {
+        Self {
+            store_access: self.store_access,
+            fallback_package_file_version: self.fallback_package_file_version,
+            log: self.log,
+            script_cells: self.script_cells.clone(),
+            script_objects: Arc::clone(&self.script_objects),
+            extra_script_objects: self.extra_script_objects.clone(),
+            inner_state: Default::default(),
+            package_lookup_locks: KeyMutex::new(),
+            package_cell_verse_path_lookup_locks: KeyMutex::new(),
+        }
+    }
+    /// Builds the script object table now rather than on first use, so threads sharing this
+    /// context, or its siblings, do not each build it while the first is still at it.
+    pub fn prepare(&self) -> anyhow::Result<()> {
+        self.get_script_objects().map(|_| ())
+    }
     fn get_script_objects(&self) -> anyhow::Result<&FZenPackageContextScriptObjects> {
         if let Some(loaded) = self.script_objects.get() {
             return Ok(loaded);
@@ -172,7 +192,11 @@ impl<'a> FZenPackageContext<'a> {
 
         // Optional package segments cannot be imported from other packages, and optional segments are also not supported outside of editor. So ChunkIndex is always 0
         let package_chunk_id = FIoChunkId::from_package_id(redirected_package_id, 0, EIoChunkType::ExportBundleData);
-        let package_data = self.store_access.read(package_chunk_id);
+        // An import needs only the header, which a package's exports dwarf.
+        let package_data = match self.store_access.container_header_version() {
+            Some(header_version) if !want_data => crate::zen::read_header_bytes(self.store_access, package_chunk_id, header_version),
+            _ => self.store_access.read(package_chunk_id),
+        };
         let package_store_entry_ref = self.store_access.package_store_entry(redirected_package_id);
 
         // Mark the package as failed load if it's chunk failed to load
@@ -192,7 +216,14 @@ impl<'a> FZenPackageContext<'a> {
         let container_version = self.store_access.container_file_version().ok_or_else(|| anyhow!("Failed to retrieve container TOC version"))?;
         let container_header_version = self.store_access.container_header_version().ok_or_else(|| anyhow!("Failed to retrieve container header version"))?;
 
-        let zen_package_header = FZenPackageHeader::deserialize(&mut zen_package_buffer, package_store_entry_ref, container_version, container_header_version, self.fallback_package_file_version);
+        let mut zen_package_header = FZenPackageHeader::deserialize(&mut zen_package_buffer, package_store_entry_ref.clone(), container_version, container_header_version, self.fallback_package_file_version);
+        // A header read from its first bytes alone that does not parse is read from the whole
+        // package before the package counts as failed.
+        if zen_package_header.is_err() && !want_data {
+            if let Ok(whole) = self.store_access.read(package_chunk_id) {
+                zen_package_header = FZenPackageHeader::deserialize(&mut Cursor::new(&whole[..]), package_store_entry_ref, container_version, container_header_version, self.fallback_package_file_version);
+            }
+        }
 
         // Mark the package as failed if we failed to parse the header
         if let Err(header_error) = zen_package_header {

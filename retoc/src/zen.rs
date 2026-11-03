@@ -22,6 +22,26 @@ pub fn get_package_name(data: &[u8], container_header_version: EIoContainerHeade
     FZenPackageHeader::get_package_name(&mut Cursor::new(data), container_header_version)
 }
 
+/// How much of a package chunk is read first for its zen header: the one compression block most
+/// headers fit in, so only a longer header costs a second read.
+pub const HEADER_GUESS: u64 = 64 * 1024;
+
+/// The bytes of package chunk `chunk` its zen header lies in rather than the whole chunk, whose
+/// exports dwarf it: the first block, then as far as the summary's header size says. A header
+/// version that carries no size reads the whole chunk.
+pub fn read_header_bytes(store: &dyn crate::iostore::IoStoreTrait, chunk: crate::FIoChunkId, header_version: EIoContainerHeaderVersion) -> Result<Vec<u8>> {
+    if header_version <= EIoContainerHeaderVersion::Initial {
+        return store.read(chunk);
+    }
+    let data = store.read_prefix(chunk, HEADER_GUESS)?;
+    // The summary's second word is the header's size.
+    let header_size = data.get(4..8).and_then(|word| word.try_into().ok()).map(u32::from_le_bytes);
+    match header_size {
+        Some(size) if u64::from(size) > data.len() as u64 => store.read_prefix(chunk, u64::from(size)),
+        _ => Ok(data),
+    }
+}
+
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct FZenPackageSummary {
     pub has_versioning_info: u32,
