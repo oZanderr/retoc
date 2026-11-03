@@ -103,6 +103,13 @@ pub trait IoStoreTrait: Send + Sync {
     fn print_info(&self, depth: usize);
 
     fn read(&self, chunk_id: FIoChunkId) -> Result<Vec<u8>>;
+    /// The first `len` bytes of the chunk, or all of it when it is shorter. A store that reads
+    /// chunks by compression blocks decompresses only the blocks they lie in.
+    fn read_prefix(&self, chunk_id: FIoChunkId, len: u64) -> Result<Vec<u8>> {
+        let mut data = self.read(chunk_id)?;
+        data.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+        Ok(data)
+    }
     fn read_raw(&self, chunk_id_raw: FIoChunkIdRaw) -> Result<Vec<u8>>;
     fn has_chunk_id(&self, chunk_id: FIoChunkId) -> bool;
     fn has_chunk_id_raw(&self, chunk_id_raw: FIoChunkIdRaw) -> bool;
@@ -332,6 +339,12 @@ impl IoStoreTrait for IoStoreBackend {
         }
         self.containers.iter().find(|c| c.has_chunk_id(chunk_id)).with_context(|| format!("{chunk_id:?} not found in any containers"))?.read(chunk_id)
     }
+    fn read_prefix(&self, mut chunk_id: FIoChunkId, len: u64) -> Result<Vec<u8>> {
+        if let Some(version) = self.container_file_version() {
+            chunk_id = chunk_id.with_version(version);
+        }
+        self.containers.iter().find(|c| c.has_chunk_id(chunk_id)).with_context(|| format!("{chunk_id:?} not found in any containers"))?.read_prefix(chunk_id, len)
+    }
     fn read_raw(&self, chunk_id_raw: FIoChunkIdRaw) -> Result<Vec<u8>> {
         self.containers.iter().find(|c| c.has_chunk_id_raw(chunk_id_raw)).with_context(|| format!("{chunk_id_raw:?} not found in any containers"))?.read_raw(chunk_id_raw)
     }
@@ -475,6 +488,12 @@ impl IoStoreTrait for IoStoreContainer {
         let index = *self.toc.chunk_id_map.get(&chunk_id).with_context(|| format!("container {:?} does not contain {:?}", self.name, chunk_id))?;
         let mut file_lock = self.cas.acquire()?;
         self.toc.read(&mut file_lock.file(), index).with_context(|| format!("Failed to read chunk {chunk_id:?}"))
+    }
+    fn read_prefix(&self, chunk_id: FIoChunkId, len: u64) -> Result<Vec<u8>> {
+        let chunk_id = chunk_id.with_version(self.toc.version);
+        let index = *self.toc.chunk_id_map.get(&chunk_id).with_context(|| format!("container {:?} does not contain {:?}", self.name, chunk_id))?;
+        let mut file_lock = self.cas.acquire()?;
+        self.toc.read_prefix(&mut file_lock.file(), index, len).with_context(|| format!("Failed to read chunk {chunk_id:?}"))
     }
     fn read_raw(&self, chunk_id_raw: FIoChunkIdRaw) -> Result<Vec<u8>> {
         self.read(FIoChunkId::from_raw(chunk_id_raw, self.toc.version))

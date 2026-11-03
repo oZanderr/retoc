@@ -746,9 +746,17 @@ impl Toc {
         self.compression_blocks.get(first..=last).is_some_and(|blocks| blocks.iter().any(|block| block.get_compression_method_index() != 0))
     }
     pub fn read<C: Read + Seek>(&self, cas_stream: &mut C, toc_entry_index: u32) -> Result<Vec<u8>> {
+        self.read_prefix(cas_stream, toc_entry_index, u64::MAX)
+    }
+    /// The first `len` bytes of the entry, or all of it when it is shorter, decompressing only the
+    /// blocks they lie in.
+    pub fn read_prefix<C: Read + Seek>(&self, cas_stream: &mut C, toc_entry_index: u32, len: u64) -> Result<Vec<u8>> {
         let offset_and_length = &self.chunk_offset_lengths[toc_entry_index as usize];
         let offset = offset_and_length.get_offset();
-        let size = offset_and_length.get_length();
+        let size = offset_and_length.get_length().min(len);
+        if size == 0 {
+            return Ok(Vec::new());
+        }
 
         let compression_block_size = self.compression_block_size;
         let first_block_index = (offset / compression_block_size as u64) as usize;
@@ -767,7 +775,9 @@ impl Toc {
         for b in blocks {
             max_buffer = max_buffer.max(align_usize(b.get_compressed_size() as usize, 16));
         }
-        let mut data = vec![0; align_usize(size as usize, 16)];
+        // Whole blocks are decompressed, so a prefix ending inside one still needs room for all of it.
+        let covered: usize = blocks.iter().map(|b| b.get_uncompressed_size() as usize).sum();
+        let mut data = vec![0; align_usize(covered.max(size as usize), 16)];
         let mut buffer = vec![0; max_buffer];
         let mut cur = 0;
         for block in blocks {
